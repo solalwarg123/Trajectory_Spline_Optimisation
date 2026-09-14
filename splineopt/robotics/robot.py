@@ -211,6 +211,47 @@ class Robot:
         ).copy()
 
     # ======================================================================
+    # Inverse kinematics
+    # ======================================================================
+
+    def ik(
+        self,
+        target_pose,
+        q0=None,
+        frame=None,
+        **kwargs,
+    ):
+        """
+        Solve full pose inverse kinematics.
+
+        Parameters
+        ----------
+        target_pose:
+            Desired pose as pin.SE3.
+
+        q0:
+            Initial configuration.
+            If None, the neutral configuration is used.
+
+        frame:
+            Frame to control.
+            If None, the default end-effector is used.
+
+        kwargs:
+            Additional parameters passed to solve_pose_ik().
+        """
+
+        from .ik import solve_pose_ik
+
+        return solve_pose_ik(
+            robot=self,
+            target_pose=target_pose,
+            q0=q0,
+            frame=frame,
+            **kwargs,
+        )
+
+    # ======================================================================
     # Visualization
     # ======================================================================
 
