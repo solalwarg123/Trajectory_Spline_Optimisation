@@ -89,9 +89,9 @@ The feasible reference is reproduced almost exactly.
 
 The infeasible reference temporarily leaves the admissible joint-position region and later comes back inside. The optimized B-spline stays inside the admissible set, deviates only when necessary, and reconnects with the reference afterwards.
 
-![Time-domain comparison](assets/trajectory_projection_time.png)
+<img width="1252" height="937" alt="image" src="https://github.com/user-attachments/assets/40ddc832-ad75-4ab0-aeae-c9d16b0c3848" />
 
-![Joint-space comparison](assets/trajectory_projection_joint_space.png)
+<img width="1917" height="943" alt="image" src="https://github.com/user-attachments/assets/def39557-688f-4a58-99c3-5d19f149e954" />
 
 ## Run
 
