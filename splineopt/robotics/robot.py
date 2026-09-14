@@ -211,6 +211,149 @@ class Robot:
         ).copy()
 
     # ======================================================================
+    # Joint-space representation
+    # ======================================================================
+
+    def joint_positions_to_configuration(self, theta):
+        """
+        Convert joint coordinates theta in R^nv to a Pinocchio
+        configuration q in the configuration manifold.
+
+        For the fixed-base Kinova Gen3, nv = 7 and theta contains
+        the seven joint angles.
+
+        The conversion is performed by integrating theta from the
+        neutral configuration.
+        """
+
+        theta = np.asarray(
+            theta,
+            dtype=float,
+        ).reshape(-1)
+
+        if theta.shape != (self.nv,):
+            raise ValueError(
+                f"Expected theta shape ({self.nv},), "
+                f"got {theta.shape}."
+            )
+
+        return pin.integrate(
+            self.model,
+            self.neutral(),
+            theta,
+        )
+
+    def configuration_to_joint_positions(self, q):
+        """
+        Convert one Pinocchio configuration to joint coordinates.
+
+        Note:
+        for continuous joints, this returns the shortest displacement
+        from the neutral configuration. For a trajectory, use
+        configuration_trajectory_to_joint_positions() instead so that
+        angles are unwrapped continuously.
+        """
+
+        q = self._check_configuration(q)
+
+        return pin.difference(
+            self.model,
+            self.neutral(),
+            q,
+        )
+
+    def configuration_trajectory_to_joint_positions(
+        self,
+        q_sequence,
+    ):
+        """
+        Convert a sequence of Pinocchio configurations to a continuous
+        joint trajectory theta(t) in R^nv.
+
+        Successive Pinocchio differences are accumulated. This prevents
+        artificial +/- pi or +/- 2*pi jumps on continuous joints.
+        """
+
+        q_sequence = np.asarray(
+            q_sequence,
+            dtype=float,
+        )
+
+        if q_sequence.ndim != 2:
+            raise ValueError(
+                "q_sequence must have shape (N, nq)."
+            )
+
+        if q_sequence.shape[1] != self.nq:
+            raise ValueError(
+                f"Expected q_sequence shape (N, {self.nq}), "
+                f"got {q_sequence.shape}."
+            )
+
+        n_samples = len(q_sequence)
+
+        if n_samples == 0:
+            return np.empty(
+                (0, self.nv)
+            )
+
+        theta = np.zeros(
+            (n_samples, self.nv)
+        )
+
+        # First configuration relative to neutral.
+        theta[0] = pin.difference(
+            self.model,
+            self.neutral(),
+            q_sequence[0],
+        )
+
+        # Then accumulate local differences.
+        for k in range(1, n_samples):
+
+            dtheta = pin.difference(
+                self.model,
+                q_sequence[k - 1],
+                q_sequence[k],
+            )
+
+            theta[k] = (
+                theta[k - 1]
+                + dtheta
+            )
+
+        return theta
+
+    def joint_trajectory_to_configurations(
+        self,
+        theta_sequence,
+    ):
+        """
+        Convert an (N, nv) joint trajectory to Pinocchio configurations.
+        """
+
+        theta_sequence = np.asarray(
+            theta_sequence,
+            dtype=float,
+        )
+
+        if theta_sequence.ndim != 2:
+            raise ValueError(
+                "theta_sequence must have shape (N, nv)."
+            )
+
+        if theta_sequence.shape[1] != self.nv:
+            raise ValueError(
+                f"Expected theta_sequence shape (N, {self.nv}), "
+                f"got {theta_sequence.shape}."
+            )
+
+        return np.asarray([
+            self.joint_positions_to_configuration(theta)
+            for theta in theta_sequence
+        ])
+
+    # ======================================================================
     # Inverse kinematics
     # ======================================================================
 
@@ -251,6 +394,27 @@ class Robot:
             **kwargs,
         )
 
+    def ik_trajectory(
+        self,
+        target_poses,
+        q0=None,
+        frame=None,
+        **kwargs,
+    ):
+        """
+        Solve sequential IK along a Cartesian trajectory.
+        """
+
+        from .ik import solve_pose_ik_trajectory
+
+        return solve_pose_ik_trajectory(
+            robot=self,
+            target_poses=target_poses,
+            q0=q0,
+            frame=frame,
+            **kwargs,
+        )
+
     # ======================================================================
     # Visualization
     # ======================================================================
@@ -282,6 +446,82 @@ class Robot:
             self.init_viewer()
 
         self.viewer.display(q)
+
+    def display_target(
+        self,
+        target_pose,
+        name="target",
+        scale=0.12,
+    ):
+        """
+        Display a target SE(3) pose in Meshcat.
+        """
+
+        if self.viewer is None:
+            self.init_viewer()
+
+        from .visualization import display_pose
+
+        display_pose(
+            self.viewer,
+            target_pose,
+            name=name,
+            scale=scale,
+        )
+
+    def remove_target(
+        self,
+        name="target",
+    ):
+        """
+        Remove a target pose from Meshcat.
+        """
+
+        if self.viewer is None:
+            return
+
+        from .visualization import remove_pose
+
+        remove_pose(
+            self.viewer,
+            name=name,
+        )
+
+    def animate(
+        self,
+        q_sequence,
+        dt=0.03,
+    ):
+        """
+        Animate a sequence of robot configurations.
+        """
+
+        if self.viewer is None:
+            self.init_viewer()
+
+        q_sequence = np.asarray(
+            q_sequence,
+            dtype=float,
+        )
+
+        if q_sequence.ndim != 2:
+            raise ValueError(
+                "q_sequence must have shape (N, nq)."
+            )
+
+        if q_sequence.shape[1] != self.nq:
+            raise ValueError(
+                f"Expected configurations with dimension "
+                f"{self.nq}, got {q_sequence.shape[1]}."
+            )
+
+        from .visualization import animate_configurations
+
+        animate_configurations(
+            self.viewer,
+            q_sequence,
+            dt=dt,
+        )
 
     # ======================================================================
     # Internal helpers

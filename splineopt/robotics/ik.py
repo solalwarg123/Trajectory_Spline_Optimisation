@@ -20,6 +20,24 @@ class IKResult:
     error_history: np.ndarray
 
 
+@dataclass
+class IKTrajectoryResult:
+    """
+    Result of sequential inverse kinematics over a Cartesian trajectory.
+    """
+
+    q_pin: np.ndarray
+    theta: np.ndarray
+
+    success: bool
+    success_mask: np.ndarray
+
+    error_norms: np.ndarray
+    iterations: np.ndarray
+
+    results: list
+
+
 def solve_pose_ik(
     robot,
     target_pose,
@@ -260,4 +278,135 @@ def solve_pose_ik(
         iterations=max_iterations,
         q_history=np.asarray(q_history),
         error_history=np.asarray(error_history),
+    )
+
+
+def solve_pose_ik_trajectory(
+    robot,
+    target_poses,
+    q0=None,
+    frame=None,
+    stop_on_failure=True,
+    **ik_kwargs,
+):
+    """
+    Solve a sequence of SE(3) inverse kinematics problems.
+
+    Each solution is used as the initial configuration of the next IK.
+    This encourages continuity of the joint trajectory and is especially
+    important for redundant robots such as the 7-DoF Kinova Gen3.
+    """
+
+    target_poses = list(
+        target_poses
+    )
+
+    if len(target_poses) == 0:
+        raise ValueError(
+            "target_poses cannot be empty."
+        )
+
+    # ------------------------------------------------------------------
+    # Initial configuration
+    # ------------------------------------------------------------------
+
+    if q0 is None:
+        q_current = robot.neutral()
+    else:
+        q_current = np.asarray(
+            q0,
+            dtype=float,
+        ).reshape(-1)
+
+        if q_current.shape != (robot.nq,):
+            raise ValueError(
+                f"Expected q0 shape ({robot.nq},), "
+                f"got {q_current.shape}."
+            )
+
+        q_current = q_current.copy()
+
+    # ------------------------------------------------------------------
+    # Storage
+    # ------------------------------------------------------------------
+
+    results = []
+    q_sequence = []
+
+    success_mask = []
+    error_norms = []
+    iterations = []
+
+    # ------------------------------------------------------------------
+    # Sequential IK
+    # ------------------------------------------------------------------
+
+    for k, target_pose in enumerate(
+        target_poses
+    ):
+
+        result = solve_pose_ik(
+            robot=robot,
+            target_pose=target_pose,
+            q0=q_current,
+            frame=frame,
+            **ik_kwargs,
+        )
+
+        results.append(result)
+
+        success_mask.append(
+            result.success
+        )
+
+        error_norms.append(
+            result.error_norm
+        )
+
+        iterations.append(
+            result.iterations
+        )
+
+        if not result.success:
+
+            if stop_on_failure:
+                raise RuntimeError(
+                    f"IK failed at trajectory sample {k}. "
+                    f"Final error: {result.error_norm:.3e}"
+                )
+
+        # Warm-start next target from previous solution.
+        q_current = result.q.copy()
+
+        q_sequence.append(
+            q_current
+        )
+
+    # ------------------------------------------------------------------
+    # Convert Pinocchio configurations to continuous joint coordinates
+    # ------------------------------------------------------------------
+
+    q_sequence = np.asarray(
+        q_sequence
+    )
+
+    theta = (
+        robot.configuration_trajectory_to_joint_positions(
+            q_sequence
+        )
+    )
+
+    success_mask = np.asarray(
+        success_mask,
+        dtype=bool,
+    )
+
+    return IKTrajectoryResult(
+        q_pin=q_sequence,
+        theta=theta,
+        success=bool(np.all(success_mask)),
+        success_mask=success_mask,
+        error_norms=np.asarray(error_norms),
+        iterations=np.asarray(iterations),
+        results=results,
     )

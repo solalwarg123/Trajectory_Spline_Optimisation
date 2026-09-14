@@ -95,16 +95,51 @@ def main():
 
     robot.init_viewer()
 
+    # Display target frame
+    robot.display_target(
+        target_pose,
+        scale=0.12,
+    )
+
+    # Initial configuration
+    robot.display(
+        q_start
+    )
+
+    time.sleep(1.0)
+
     print()
-    print("Displaying initial configuration...")
+    print("Animating IK convergence...")
 
-    robot.display(q_start)
+    robot.animate(
+        result.q_history,
+        dt=0.03,
+    )
 
-    time.sleep(2.0)
+    # ------------------------------------------------------------------
+    # Final result
+    # ------------------------------------------------------------------
 
-    print("Displaying IK solution...")
+    achieved_pose = robot.frame_pose(
+        result.q
+    )
 
-    robot.display(result.q)
+    print()
+    print("Target position:")
+    print(target_pose.translation)
+
+    print()
+    print("Achieved position:")
+    print(achieved_pose.translation)
+
+    print()
+    print(
+        "Position error:",
+        np.linalg.norm(
+            target_pose.translation
+            - achieved_pose.translation
+        ),
+    )
 
     input(
         "Press Enter to quit..."

@@ -334,3 +334,64 @@ def test_invalid_frame(robot):
             q,
             frame="this_frame_does_not_exist",
         )
+
+
+def test_joint_position_round_trip(robot):
+
+    theta = np.array([
+        0.20,
+        -0.30,
+        0.15,
+        -0.25,
+        0.10,
+        0.20,
+        -0.15,
+    ])
+
+    q = robot.joint_positions_to_configuration(
+        theta
+    )
+
+    theta_back = (
+        robot.configuration_to_joint_positions(
+            q
+        )
+    )
+
+    np.testing.assert_allclose(
+        theta_back,
+        theta,
+        atol=1e-10,
+    )
+
+
+def test_joint_trajectory_unwrap(robot):
+
+    # Make a trajectory crossing pi on joint 1.
+    theta_ref = np.zeros(
+        (20, robot.nv)
+    )
+
+    theta_ref[:, 0] = np.linspace(
+        2.8,
+        3.5,
+        20,
+    )
+
+    q_sequence = (
+        robot.joint_trajectory_to_configurations(
+            theta_ref
+        )
+    )
+
+    theta_reconstructed = (
+        robot.configuration_trajectory_to_joint_positions(
+            q_sequence
+        )
+    )
+
+    np.testing.assert_allclose(
+        theta_reconstructed,
+        theta_ref,
+        atol=1e-10,
+    )

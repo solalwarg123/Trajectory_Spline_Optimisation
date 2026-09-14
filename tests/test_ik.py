@@ -215,3 +215,87 @@ def test_ik_history(robot):
         <
         result.error_history[0]
     )
+
+
+def test_ik_trajectory(robot):
+
+    # -------------------------------------------------------------
+    # Build a known reachable joint trajectory
+    # -------------------------------------------------------------
+
+    n_samples = 20
+
+    s = np.linspace(
+        0.0,
+        1.0,
+        n_samples,
+    )
+
+    theta = np.zeros(
+        (n_samples, robot.nv)
+    )
+
+    theta[:, 0] = 0.20 + 0.15 * s
+    theta[:, 1] = -0.40 + 0.10 * s
+    theta[:, 2] = 0.15 * np.sin(np.pi * s)
+    theta[:, 3] = -0.50 + 0.20 * s
+    theta[:, 4] = 0.10 * np.sin(2 * np.pi * s)
+    theta[:, 5] = 0.30 - 0.10 * s
+    theta[:, 6] = 0.10 * s
+
+    q_known = (
+        robot.joint_trajectory_to_configurations(
+            theta
+        )
+    )
+
+    # -------------------------------------------------------------
+    # Use FK to generate reachable Cartesian targets
+    # -------------------------------------------------------------
+
+    targets = [
+        robot.frame_pose(q)
+        for q in q_known
+    ]
+
+    # -------------------------------------------------------------
+    # Sequential IK
+    # -------------------------------------------------------------
+
+    result = robot.ik_trajectory(
+        targets,
+        q0=q_known[0],
+        tolerance=1e-5,
+        max_iterations=500,
+        step_size=0.1,
+        damping=1e-6,
+    )
+
+    assert result.success
+
+    assert result.q_pin.shape == (
+        n_samples,
+        robot.nq,
+    )
+
+    assert result.theta.shape == (
+        n_samples,
+        robot.nv,
+    )
+
+    # -------------------------------------------------------------
+    # Verify every achieved Cartesian pose
+    # -------------------------------------------------------------
+
+    for q, target in zip(
+        result.q_pin,
+        targets,
+    ):
+
+        achieved = robot.frame_pose(q)
+
+        error = pin.log6(
+            achieved.actInv(target)
+        ).vector
+
+        assert np.linalg.norm(error) < 1e-5
