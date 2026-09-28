@@ -44,6 +44,8 @@ from examples.kinova_trajectory_projection import (
 CARTESIAN_DAMPING = 1e-3
 CARTESIAN_MAX_ITERATIONS = 20
 
+CARTESIAN_TERMINAL_WEIGHT = 1.0
+
 # Equivalent translation scale of one radian of orientation error.
 #
 # orientation cost:
@@ -1675,6 +1677,7 @@ def main():
             lambda_smooth=LAMBDA_SMOOTH,
             damping=CARTESIAN_DAMPING,
             orientation_scale=0.0,
+            lambda_terminal=CARTESIAN_TERMINAL_WEIGHT
         )
     )
 
@@ -1685,6 +1688,7 @@ def main():
             lambda_smooth=LAMBDA_SMOOTH,
             damping=CARTESIAN_DAMPING,
             orientation_scale=ORIENTATION_SCALE,
+            lambda_terminal=CARTESIAN_TERMINAL_WEIGHT
         )
     )
 
@@ -1756,6 +1760,7 @@ def main():
             q0=theta_ref[0],
             v0=np.zeros(robot.nv),
             a0=np.zeros(robot.nv),
+            vf=np.zeros(robot.nv),
             q_min=Q_MIN,
             q_max=Q_MAX,
             v_min=V_MIN,
@@ -1808,6 +1813,7 @@ def main():
             q0=theta_ref[0],
             v0=np.zeros(robot.nv),
             a0=np.zeros(robot.nv),
+            vf=np.zeros(robot.nv),
             q_min=Q_MIN,
             q_max=Q_MAX,
             v_min=V_MIN,

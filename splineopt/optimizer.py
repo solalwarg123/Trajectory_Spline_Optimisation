@@ -86,6 +86,7 @@ def _build_joint_constraints(
     a_min,
     a_max,
     a0=None,
+    vf=None,
 ):
     """
     Build the linear B-spline constraints
@@ -130,6 +131,21 @@ def _build_joint_constraints(
         )
         equality_values.append(
             dof_vector(a0, "a0")
+        )
+
+    # Final velocity condition
+    if vf is not None:
+        tf = spline.t_end
+
+        equality_matrices.append(
+            spline.evaluation_matrix(
+                tf,
+                derivative_order=1,
+            )
+        )
+
+        equality_values.append(
+            dof_vector(vf, "vf")
         )
 
     A_eq = sp.csc_matrix(
@@ -285,6 +301,7 @@ class JointTrajectoryOptimizer:
         a_min,
         a_max,
         a0=None,
+        vf=None,
     ):
         return _build_joint_constraints(
             spline=self.spline,
@@ -297,6 +314,7 @@ class JointTrajectoryOptimizer:
             a_min=a_min,
             a_max=a_max,
             a0=a0,
+            vf=vf,
         )
 
     def build_qp(
@@ -312,6 +330,7 @@ class JointTrajectoryOptimizer:
         a_min,
         a_max,
         a0=None,
+        vf=None,
     ):
         """
         Build the QP matrices
@@ -491,6 +510,7 @@ class JointTrajectoryOptimizer:
             a_min=a_min,
             a_max=a_max,
             a0=a0,
+            vf=vf
         )
 
         return P, g, A, l, u
@@ -513,6 +533,7 @@ class JointTrajectoryOptimizer:
         a_max,
         a0=None,
         verbose=False,
+        vf=None,
     ):
         """
         Build and solve the joint-space trajectory QP.
@@ -540,6 +561,7 @@ class JointTrajectoryOptimizer:
             a_min=a_min,
             a_max=a_max,
             a0=a0,
+            vf=vf
         )
 
         solver = osqp.OSQP()
@@ -615,6 +637,7 @@ class CartesianTrajectoryOptimizer:
         lambda_smooth=1e-5,
         damping=1e-4,
         orientation_scale=0.10,
+        lambda_terminal=0.0,
     ):
         self.robot = robot
         self.spline = spline
@@ -630,6 +653,15 @@ class CartesianTrajectoryOptimizer:
         self.orientation_scale = float(
             orientation_scale
         )
+
+        self.lambda_terminal = float(
+            lambda_terminal
+        )
+
+        if self.lambda_terminal < 0.0:
+            raise ValueError(
+                "lambda_terminal must be non-negative."
+            )
 
         if self.orientation_scale < 0.0:
             raise ValueError(
@@ -870,6 +902,86 @@ class CartesianTrajectoryOptimizer:
             target_poses=target_poses,
         )
 
+    def optimization_residual_and_jacobian(
+        self,
+        control_points,
+        tracking_times,
+        target_poses,
+    ):
+        """
+        Build the complete least-squares residual used by the optimizer.
+
+        It contains:
+
+            - time-integrated Cartesian tracking;
+            - an optional additional terminal Cartesian cost.
+
+        The terminal contribution is
+
+            lambda_terminal * ||r(tf)||^2
+
+        and is implemented by scaling the terminal residual and Jacobian
+        by sqrt(lambda_terminal).
+        """
+
+        residual, jacobian = (
+            self.weighted_tracking_residual_and_jacobian(
+                control_points=control_points,
+                tracking_times=tracking_times,
+                target_poses=target_poses,
+            )
+        )
+
+        if self.lambda_terminal == 0.0:
+            return residual, jacobian
+
+        tracking_times = np.asarray(
+            tracking_times,
+            dtype=float,
+        ).reshape(-1)
+
+        if tracking_times.size == 0:
+            raise ValueError(
+                "tracking_times cannot be empty."
+            )
+
+        if len(target_poses) != len(tracking_times):
+            raise ValueError(
+                "target_poses must have the same length "
+                "as tracking_times."
+            )
+
+        terminal_time = tracking_times[-1]
+        terminal_pose = target_poses[-1]
+
+        terminal_residual, terminal_jacobian = (
+            self.weighted_tracking_residual_and_jacobian(
+                control_points=control_points,
+                tracking_times=np.array([
+                    terminal_time
+                ]),
+                target_poses=[
+                    terminal_pose
+                ],
+            )
+        )
+
+        terminal_scale = np.sqrt(
+            self.lambda_terminal
+        )
+
+        residual = np.concatenate([
+            residual,
+            terminal_scale * terminal_residual,
+        ])
+
+        jacobian = np.vstack([
+            jacobian,
+            terminal_scale * terminal_jacobian,
+        ])
+
+        return residual, jacobian
+
     def objective(
         self,
         control_points,
@@ -889,7 +1001,7 @@ class CartesianTrajectoryOptimizer:
         """
 
         residual, _ = (
-            self.weighted_tracking_residual_and_jacobian(
+            self.optimization_residual_and_jacobian(
                 control_points=control_points,
                 tracking_times=tracking_times,
                 target_poses=target_poses,
@@ -959,6 +1071,7 @@ class CartesianTrajectoryOptimizer:
         a_min,
         a_max,
         a0=None,
+        vf=None
     ):
         """
         Build one constrained Gauss-Newton QP.
@@ -989,7 +1102,7 @@ class CartesianTrajectoryOptimizer:
         # integral ||r(t)||² dt
 
         r, J = (
-            self.weighted_tracking_residual_and_jacobian(
+            self.optimization_residual_and_jacobian(
                 control_points=c_i,
                 tracking_times=tracking_times,
                 target_poses=target_poses,
@@ -1052,6 +1165,7 @@ class CartesianTrajectoryOptimizer:
             a_min=a_min,
             a_max=a_max,
             a0=a0,
+            vf=vf
         )
 
         return P, g, A, l, u
@@ -1070,6 +1184,7 @@ class CartesianTrajectoryOptimizer:
         a_min,
         a_max,
         a0=None,
+        vf=None,
         verbose=False,
     ):
         """
@@ -1092,6 +1207,7 @@ class CartesianTrajectoryOptimizer:
                 a_min=a_min,
                 a_max=a_max,
                 a0=a0,
+                vf=vf,
             )
         )
 
@@ -1246,6 +1362,7 @@ class CartesianTrajectoryOptimizer:
         a_min,
         a_max,
         a0=None,
+        vf=None,
         max_iterations=20,
         step_tolerance=1e-6,
         cost_tolerance=1e-8,
@@ -1313,6 +1430,7 @@ class CartesianTrajectoryOptimizer:
                 a_min=a_min,
                 a_max=a_max,
                 a0=a0,
+                vf=vf,
                 verbose=False,
             )
 

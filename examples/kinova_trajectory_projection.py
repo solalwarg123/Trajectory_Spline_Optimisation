@@ -217,6 +217,7 @@ def solve_bspline_projection(robot, times, theta_ref):
         q0=theta_ref[0],
         v0=np.zeros(robot.nv),
         a0=np.zeros(robot.nv),
+        vf=np.zeros(robot.nv),
         q_min=Q_MIN,
         q_max=Q_MAX,
         v_min=V_MIN,
