@@ -38,6 +38,9 @@ N_DENSE_SAMPLES = 700
 # Animation speed multiplier (> 1 = faster than physical time)
 ANIMATION_SPEED = 2.0
 
+# Numerical tolerance consistent with OSQP solver accuracy.
+SOLVER_FEASIBILITY_TOL = 1e-3
+
 # ---------------------------------------------------------------------
 # Kinova Gen3 limits used in this project
 # ---------------------------------------------------------------------
@@ -766,6 +769,7 @@ def print_metrics(
     print(
         f"Optimized max rho_a:         {np.max(symmetric_usage(a_opt_dense, A_MAX)):.3f}")
     print()
+
     print(
         f"Cartesian RMS deviation:     {np.sqrt(np.mean(cart_error ** 2)) * 1000:.2f} mm")
     print(f"Cartesian max deviation:     {np.max(cart_error) * 1000:.2f} mm")
@@ -952,7 +956,7 @@ def main():
         q_opt_dense,
         v_opt_dense,
         a_opt_dense,
-        atol=2e-6,
+        atol=SOLVER_FEASIBILITY_TOL,
     )
 
     print(
@@ -1043,7 +1047,6 @@ def main():
     # 7) Meshcat
     # -----------------------------------------------------------------
 
-    print()
     print("Opening Meshcat...")
 
     robot.init_viewer(open_browser=True)
@@ -1095,6 +1098,7 @@ def main():
     print("  blue  = optimized constrained B-spline path")
 
     input("\nPress Enter to animate the NOMINAL IK trajectory...")
+    time.sleep(0.5)
 
     robot.animate(
         ik_result.q_pin,
