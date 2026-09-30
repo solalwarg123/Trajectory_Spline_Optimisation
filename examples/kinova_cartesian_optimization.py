@@ -6,7 +6,12 @@ import pinocchio as pin
 
 from mpl_toolkits.mplot3d.art3d import Line3DCollection
 
-from splineopt.optimizer import CartesianTrajectoryOptimizer
+from splineopt.cartesian_problem import (
+    CartesianTrajectoryProblem,
+)
+from splineopt.optimizer import (
+    GaussNewtonSolver,
+)
 from splineopt.robotics import Robot
 
 from examples.kinova_trajectory_projection import (
@@ -1667,29 +1672,45 @@ def main():
     )
 
     # =================================================================
-    # 4) Two Cartesian optimizers
+    # 4) Cartesian problems and Gauss-Newton solver
     # =================================================================
 
-    position_optimizer = (
-        CartesianTrajectoryOptimizer(
-            robot=robot,
-            spline=spline,
-            lambda_smooth=LAMBDA_SMOOTH,
-            damping=CARTESIAN_DAMPING,
-            orientation_scale=0.0,
-            lambda_terminal=CARTESIAN_TERMINAL_WEIGHT
-        )
+    common_problem_kwargs = {
+        "robot": robot,
+        "spline": spline,
+        "tracking_times": times,
+        "target_poses": target_poses,
+
+        "q0": theta_ref[0],
+        "v0": np.zeros(robot.nv),
+        "a0": np.zeros(robot.nv),
+        "vf": np.zeros(robot.nv),
+
+        "q_min": Q_MIN,
+        "q_max": Q_MAX,
+        "v_min": V_MIN,
+        "v_max": V_MAX,
+        "a_min": A_MIN,
+        "a_max": A_MAX,
+
+        "lambda_smooth": LAMBDA_SMOOTH,
+        "lambda_terminal": CARTESIAN_TERMINAL_WEIGHT,
+    }
+
+    position_problem = CartesianTrajectoryProblem(
+        **common_problem_kwargs,
+        orientation_scale=0.0,
     )
 
-    pose_optimizer = (
-        CartesianTrajectoryOptimizer(
-            robot=robot,
-            spline=spline,
-            lambda_smooth=LAMBDA_SMOOTH,
-            damping=CARTESIAN_DAMPING,
-            orientation_scale=ORIENTATION_SCALE,
-            lambda_terminal=CARTESIAN_TERMINAL_WEIGHT
-        )
+    pose_problem = CartesianTrajectoryProblem(
+        **common_problem_kwargs,
+        orientation_scale=ORIENTATION_SCALE,
+    )
+
+    solver = GaussNewtonSolver(
+        damping_mode="adaptive",
+        damping=CARTESIAN_DAMPING,
+        max_iterations=CARTESIAN_MAX_ITERATIONS,
     )
 
     # -----------------------------------------------------------------
@@ -1697,10 +1718,8 @@ def main():
     # -----------------------------------------------------------------
 
     initial_metrics = (
-        pose_optimizer.pose_error_metrics(
-            initial_control_points,
-            times,
-            target_poses,
+        pose_problem.error_metrics(
+            initial_control_points
         )
     )
 
@@ -1739,37 +1758,17 @@ def main():
     # =================================================================
 
     print()
-    print(
-        "=" * 76
-    )
-
+    print("=" * 76)
     print(
         "Solving Cartesian B-spline optimization "
         "(POSITION ONLY)..."
     )
+    print("=" * 76)
 
-    print(
-        "=" * 76
-    )
-
-    position_result = (
-        position_optimizer.solve(
-            tracking_times=times,
-            target_poses=target_poses,
-            initial_control_points=initial_control_points,
-            q0=theta_ref[0],
-            v0=np.zeros(robot.nv),
-            a0=np.zeros(robot.nv),
-            vf=np.zeros(robot.nv),
-            q_min=Q_MIN,
-            q_max=Q_MAX,
-            v_min=V_MIN,
-            v_max=V_MAX,
-            a_min=A_MIN,
-            a_max=A_MAX,
-            max_iterations=CARTESIAN_MAX_ITERATIONS,
-            verbose=True,
-        )
+    position_result = solver.solve(
+        problem=position_problem,
+        initial_control_points=initial_control_points,
+        verbose=True,
     )
 
     position_control_points = (
@@ -1792,37 +1791,17 @@ def main():
     # =================================================================
 
     print()
-    print(
-        "=" * 76
-    )
-
+    print("=" * 76)
     print(
         "Solving Cartesian B-spline optimization "
         "(FULL SE(3) POSE)..."
     )
+    print("=" * 76)
 
-    print(
-        "=" * 76
-    )
-
-    pose_result = (
-        pose_optimizer.solve(
-            tracking_times=times,
-            target_poses=target_poses,
-            initial_control_points=initial_control_points,
-            q0=theta_ref[0],
-            v0=np.zeros(robot.nv),
-            a0=np.zeros(robot.nv),
-            vf=np.zeros(robot.nv),
-            q_min=Q_MIN,
-            q_max=Q_MAX,
-            v_min=V_MIN,
-            v_max=V_MAX,
-            a_min=A_MIN,
-            a_max=A_MAX,
-            max_iterations=CARTESIAN_MAX_ITERATIONS,
-            verbose=True,
-        )
+    pose_result = solver.solve(
+        problem=pose_problem,
+        initial_control_points=initial_control_points,
+        verbose=True,
     )
 
     pose_control_points = (

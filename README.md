@@ -647,7 +647,19 @@ smooth joint motion
 continuous-time q / v / a constraints
 ```
 
+### Adaptive damping experiment
+
+An adaptive damping strategy inspired by Levenberg–Marquardt was evaluated against the default fixed-damping Gauss–Newton solver. The damping parameter was updated according to the agreement between the nonlinear objective decrease and the decrease predicted by the local Gauss–Newton model.
+
+On the current Kinova Cartesian tracking benchmark, the benefits were mixed. For full SE(3) tracking, adaptive damping reached a final dense tracking error of **13.06 mm RMS in position** and **5.85° RMS in orientation**, with a maximum orientation error of **15.94°**. This is only a modest improvement over the fixed-damping baseline, which achieved approximately **13.35 mm**, **5.81°**, and **16.97°**, respectively.
+
+For position-only tracking, adaptive damping performed worse than the fixed strategy: the dense position RMS error was **10.41 mm**, compared with approximately **9.00 mm** using fixed damping.
+
+Adaptive damping also introduces additional QP solves when the line search fails and the step is recomputed with increased damping. Given the limited and problem-dependent improvements observed so far, **fixed damping remains the default strategy**, while adaptive damping is kept as an experimental option. Its usefulness will be reassessed in a future receding-horizon setting, where robustness must be balanced against computation time.
+
 ---
+
+
 
 ## Run
 
