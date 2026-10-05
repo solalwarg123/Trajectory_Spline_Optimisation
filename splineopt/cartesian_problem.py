@@ -812,6 +812,41 @@ class CartesianTrajectoryProblem:
             + smoothness_cost
         )
 
+    def gradient(
+        self,
+        control_points,
+    ):
+        """Return the gradient of the complete nonlinear objective."""
+
+        c = np.asarray(
+            control_points,
+            dtype=float,
+        ).reshape(-1)
+
+        residual, jacobian = (
+            self.residual_and_jacobian(
+                c
+            )
+        )
+
+        tracking_gradient = (
+            2.0
+            * jacobian.T
+            @ residual
+        )
+
+        smoothness_gradient = (
+            2.0
+            * self.lambda_smooth
+            * self.R2
+            @ c
+        )
+
+        return (
+            tracking_gradient
+            + smoothness_gradient
+        )
+
     # =========================================================
     # Metrics
     # =========================================================
