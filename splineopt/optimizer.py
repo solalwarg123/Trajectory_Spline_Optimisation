@@ -2,10 +2,9 @@ import numpy as np
 import scipy.sparse as sp
 import osqp
 from dataclasses import dataclass, field
-import pinocchio as pin
+from splineopt.constraints import build_joint_constraints
 
 
-@dataclass
 @dataclass
 class CartesianIteration:
     iteration: int
@@ -75,173 +74,6 @@ def _trapezoidal_weights(times):
     return weights
 
 
-def _build_joint_constraints(
-    spline,
-    q0,
-    v0,
-    q_min,
-    q_max,
-    v_min,
-    v_max,
-    a_min,
-    a_max,
-    a0=None,
-    vf=None,
-):
-    """
-    Build the linear B-spline constraints
-
-        l <= A c <= u.
-    """
-
-    n_dof = spline.n_dof
-    n_control_points = spline.n_control_points
-    n_variables = n_control_points * n_dof
-
-    def dof_vector(value, name):
-        value = np.asarray(value, dtype=float).reshape(-1)
-
-        if value.size != n_dof:
-            raise ValueError(
-                f"{name} must contain {n_dof} values, "
-                f"got {value.size}."
-            )
-
-        return value
-
-    # Initial conditions
-    t0 = spline.t_start
-
-    equality_matrices = [
-        spline.evaluation_matrix(t0, derivative_order=0),
-        spline.evaluation_matrix(t0, derivative_order=1),
-    ]
-
-    equality_values = [
-        dof_vector(q0, "q0"),
-        dof_vector(v0, "v0"),
-    ]
-
-    if a0 is not None:
-        equality_matrices.append(
-            spline.evaluation_matrix(
-                t0,
-                derivative_order=2,
-            )
-        )
-        equality_values.append(
-            dof_vector(a0, "a0")
-        )
-
-    # Final velocity condition
-    if vf is not None:
-        tf = spline.t_end
-
-        equality_matrices.append(
-            spline.evaluation_matrix(
-                tf,
-                derivative_order=1,
-            )
-        )
-
-        equality_values.append(
-            dof_vector(vf, "vf")
-        )
-
-    A_eq = sp.csc_matrix(
-        np.vstack(equality_matrices)
-    )
-
-    b_eq = np.concatenate(
-        equality_values
-    )
-
-    # Position
-    q_min = dof_vector(q_min, "q_min")
-    q_max = dof_vector(q_max, "q_max")
-
-    I = sp.eye(
-        n_variables,
-        format="csc",
-    )
-
-    l_position = np.tile(
-        q_min,
-        n_control_points,
-    )
-
-    u_position = np.tile(
-        q_max,
-        n_control_points,
-    )
-
-    # Velocity
-    v_min = dof_vector(v_min, "v_min")
-    v_max = dof_vector(v_max, "v_max")
-
-    D1 = sp.csc_matrix(
-        spline.derivative_control_matrix(order=1)
-    )
-
-    l_velocity = np.tile(
-        v_min,
-        n_control_points - 1,
-    )
-
-    u_velocity = np.tile(
-        v_max,
-        n_control_points - 1,
-    )
-
-    # Acceleration
-    a_min = dof_vector(a_min, "a_min")
-    a_max = dof_vector(a_max, "a_max")
-
-    D2 = sp.csc_matrix(
-        spline.derivative_control_matrix(order=2)
-    )
-
-    l_acceleration = np.tile(
-        a_min,
-        n_control_points - 2,
-    )
-
-    u_acceleration = np.tile(
-        a_max,
-        n_control_points - 2,
-    )
-
-    A = sp.vstack(
-        [
-            A_eq,
-            I,
-            D1,
-            D2,
-        ],
-        format="csc",
-    )
-
-    l = np.concatenate(
-        [
-            b_eq,
-            l_position,
-            l_velocity,
-            l_acceleration,
-        ]
-    )
-
-    u = np.concatenate(
-        [
-            b_eq,
-            u_position,
-            u_velocity,
-            u_acceleration,
-        ]
-    )
-
-    return A, l, u
-
-
 class JointTrajectoryOptimizer:
     """
     Joint-space B-spline trajectory optimizer.
@@ -303,7 +135,7 @@ class JointTrajectoryOptimizer:
         a0=None,
         vf=None,
     ):
-        return _build_joint_constraints(
+        return build_joint_constraints(
             spline=self.spline,
             q0=q0,
             v0=v0,
@@ -621,473 +453,205 @@ class JointTrajectoryOptimizer:
         return value
 
 
-class CartesianTrajectoryOptimizer:
-    """
-    Cartesian B-spline trajectory optimizer.
+class GaussNewtonSolver:
+    """Constrained Gauss-Newton solver.
 
-    First implementation: Cartesian position tracking only.
+    This class knows how to solve a trajectory optimization
+    problem but does not define the trajectory problem itself.
 
-    The optimization variables are the B-spline control points c.
+    The problem provides:
+        - residuals and Jacobians,
+        - the nonlinear objective,
+        - linear constraints,
+        - error metrics.
+
+    The solver provides:
+        - Gauss-Newton quadratic models,
+        - OSQP solves,
+        - backtracking line search,
+        - convergence logic.
     """
 
     def __init__(
         self,
-        robot,
-        spline,
-        lambda_smooth=1e-5,
+        *,
         damping=1e-4,
-        orientation_scale=0.10,
-        lambda_terminal=0.0,
+        damping_mode="static",
+        damping_increase=2.0,
+        damping_decrease=2.0,
+        rho_low=0.25,
+        rho_high=0.75,
+        min_damping=1e-10,
+        max_damping=1e6,
+        max_damping_retries=2,
+        max_iterations=20,
+        step_tolerance=1e-6,
+        cost_tolerance=1e-8,
+        line_search_shrink=0.5,
+        min_alpha=1e-4,
     ):
-        self.robot = robot
-        self.spline = spline
-
-        self.lambda_smooth = float(
-            lambda_smooth
-        )
-
         self.damping = float(
             damping
         )
 
-        self.orientation_scale = float(
-            orientation_scale
+        self.damping_mode = str(
+            damping_mode
         )
 
-        self.lambda_terminal = float(
-            lambda_terminal
+        self.damping_increase = float(
+            damping_increase
         )
 
-        if self.lambda_terminal < 0.0:
-            raise ValueError(
-                "lambda_terminal must be non-negative."
-            )
+        self.damping_decrease = float(
+            damping_decrease
+        )
 
-        if self.orientation_scale < 0.0:
-            raise ValueError(
-                "orientation_scale must be non negative."
-            )
+        self.rho_low = float(
+            rho_low
+        )
 
-        if spline.n_dof != robot.nv:
-            raise ValueError(
-                "spline.n_dof must match robot.nv."
-            )
+        self.rho_high = float(
+            rho_high
+        )
 
-        if self.lambda_smooth < 0.0:
-            raise ValueError(
-                "lambda_smooth must be non-negative."
-            )
+        self.min_damping = float(
+            min_damping
+        )
+
+        self.max_damping = float(
+            max_damping
+        )
+
+        self.max_damping_retries = int(
+            max_damping_retries
+        )
+
+        self.max_iterations = int(
+            max_iterations
+        )
+
+        self.step_tolerance = float(
+            step_tolerance
+        )
+
+        self.cost_tolerance = float(
+            cost_tolerance
+        )
+
+        self.line_search_shrink = float(
+            line_search_shrink
+        )
+
+        self.min_alpha = float(
+            min_alpha
+        )
+
+        self._validate_parameters()
+
+    # =========================================================
+    # Validation
+    # =========================================================
+
+    def _validate_parameters(self):
 
         if self.damping < 0.0:
             raise ValueError(
                 "damping must be non-negative."
             )
 
-        self.R2 = spline.smoothness_matrix(
-            derivative_order=2
-        )
+        if self.damping_mode not in {
+            "static",
+            "adaptive",
+        }:
+            raise ValueError(
+                "damping_mode must be "
+                "'static' or 'adaptive'."
+            )
 
-    def residual_and_jacobian(
-        self,
-        control_points,
-        tracking_times,
-        target_positions,
-    ):
-        """
-        Compute Cartesian position residual and its analytical
-        Jacobian with respect to the B-spline control points.
+        if self.damping_increase <= 1.0:
+            raise ValueError(
+                "damping_increase must be > 1."
+            )
 
-        For each time t_k:
+        if self.damping_decrease <= 1.0:
+            raise ValueError(
+                "damping_decrease must be > 1."
+            )
 
-            theta_k = A_k c
-
-            r_k = p(theta_k) - p_ref,k
-
-            dr_k/dc = J_p(theta_k) A_k
-        """
-
-        tracking_times = np.asarray(
-            tracking_times,
-            dtype=float,
-        ).reshape(-1)
-
-        target_positions = np.asarray(
-            target_positions,
-            dtype=float,
-        )
-
-        if target_positions.shape != (
-            len(tracking_times),
-            3,
+        if not (
+            0.0
+            <= self.rho_low
+            < self.rho_high
         ):
             raise ValueError(
-                "target_positions must have shape "
-                f"({len(tracking_times)}, 3)."
+                "rho thresholds must satisfy "
+                "0 <= rho_low < rho_high."
             )
 
-        c = np.asarray(
-            control_points,
-            dtype=float,
-        ).reshape(-1)
-
-        n_variables = (
-            self.spline.n_control_points
-            * self.spline.n_dof
-        )
-
-        if c.size != n_variables:
+        if self.min_damping <= 0.0:
             raise ValueError(
-                f"Expected {n_variables} control-point values, "
-                f"got {c.size}."
+                "min_damping must be positive."
             )
 
-        residual = np.empty(
-            3 * len(tracking_times)
-        )
-
-        jacobian = np.empty(
-            (
-                3 * len(tracking_times),
-                n_variables,
+        if self.max_damping < self.min_damping:
+            raise ValueError(
+                "max_damping must be >= min_damping."
             )
-        )
 
-        for k, t in enumerate(
-            tracking_times
+        if self.max_damping_retries < 0:
+            raise ValueError(
+                "max_damping_retries must be non-negative."
+            )
+
+        if self.max_iterations <= 0:
+            raise ValueError(
+                "max_iterations must be positive."
+            )
+
+        if self.step_tolerance < 0.0:
+            raise ValueError(
+                "step_tolerance must be non-negative."
+            )
+
+        if self.cost_tolerance < 0.0:
+            raise ValueError(
+                "cost_tolerance must be non-negative."
+            )
+
+        if not (
+            0.0
+            < self.line_search_shrink
+            < 1.0
         ):
-
-            # B-spline:
-            #
-            # theta(t) = A_k c
-
-            A_k = self.spline.evaluation_matrix(
-                t,
-                derivative_order=0,
-            )
-
-            theta = A_k @ c
-
-            # Pinocchio configuration
-
-            q_pin = (
-                self.robot
-                .joint_positions_to_configuration(
-                    theta
-                )
-            )
-
-            # End-effector position
-
-            position = (
-                self.robot.frame_position(
-                    q_pin
-                )
-            )
-
-            # Pinocchio frame Jacobian
-            #
-            # LOCAL_WORLD_ALIGNED is the default in Robot,
-            # so the translational rows correspond to the
-            # derivative of the world-frame position.
-
-            J_frame = (
-                self.robot.frame_jacobian(
-                    q_pin
-                )
-            )
-
-            J_position = J_frame[:3, :]
-
-            # Chain rule:
-            #
-            # dp/dc = dp/dtheta * dtheta/dc
-            #
-            #       = J_position @ A_k
-
-            J_control_points = (
-                J_position @ A_k
-            )
-
-            row = slice(
-                3 * k,
-                3 * (k + 1),
-            )
-
-            residual[row] = (
-                position
-                - target_positions[k]
-            )
-
-            jacobian[row, :] = (
-                J_control_points
-            )
-
-        return residual, jacobian
-
-    def weighted_residual_and_jacobian(
-        self,
-        control_points,
-        tracking_times,
-        target_positions,
-    ):
-        """
-        Apply trapezoidal quadrature weights so that the
-        least-squares objective approximates a time integral.
-        """
-
-        residual, jacobian = (
-            self.residual_and_jacobian(
-                control_points=control_points,
-                tracking_times=tracking_times,
-                target_positions=target_positions,
-            )
-        )
-
-        weights = _trapezoidal_weights(
-            tracking_times
-        )
-
-        sqrt_weights = np.repeat(
-            np.sqrt(weights),
-            3,
-        )
-
-        residual_weighted = (
-            sqrt_weights
-            * residual
-        )
-
-        jacobian_weighted = (
-            sqrt_weights[:, None]
-            * jacobian
-        )
-
-        return (
-            residual_weighted,
-            jacobian_weighted,
-        )
-
-    def weighted_tracking_residual_and_jacobian(
-        self,
-        control_points,
-        tracking_times,
-        target_poses,
-    ):
-        """
-        Tracking residual used by the optimizer.
-
-        orientation_scale == 0:
-            exact Cartesian position-only tracking.
-
-        orientation_scale > 0:
-            full SE(3) pose tracking.
-        """
-
-        if self.orientation_scale == 0.0:
-
-            target_positions = np.array([
-                pose.translation.copy()
-                for pose in target_poses
-            ])
-
-            return self.weighted_residual_and_jacobian(
-                control_points=control_points,
-                tracking_times=tracking_times,
-                target_positions=target_positions,
-            )
-
-        return self.weighted_pose_residual_and_jacobian(
-            control_points=control_points,
-            tracking_times=tracking_times,
-            target_poses=target_poses,
-        )
-
-    def optimization_residual_and_jacobian(
-        self,
-        control_points,
-        tracking_times,
-        target_poses,
-    ):
-        """
-        Build the complete least-squares residual used by the optimizer.
-
-        It contains:
-
-            - time-integrated Cartesian tracking;
-            - an optional additional terminal Cartesian cost.
-
-        The terminal contribution is
-
-            lambda_terminal * ||r(tf)||^2
-
-        and is implemented by scaling the terminal residual and Jacobian
-        by sqrt(lambda_terminal).
-        """
-
-        residual, jacobian = (
-            self.weighted_tracking_residual_and_jacobian(
-                control_points=control_points,
-                tracking_times=tracking_times,
-                target_poses=target_poses,
-            )
-        )
-
-        if self.lambda_terminal == 0.0:
-            return residual, jacobian
-
-        tracking_times = np.asarray(
-            tracking_times,
-            dtype=float,
-        ).reshape(-1)
-
-        if tracking_times.size == 0:
             raise ValueError(
-                "tracking_times cannot be empty."
+                "line_search_shrink must be in (0, 1)."
             )
 
-        if len(target_poses) != len(tracking_times):
+        if not (
+            0.0
+            < self.min_alpha
+            <= 1.0
+        ):
             raise ValueError(
-                "target_poses must have the same length "
-                "as tracking_times."
+                "min_alpha must be in (0, 1]."
             )
-
-        terminal_time = tracking_times[-1]
-        terminal_pose = target_poses[-1]
-
-        terminal_residual, terminal_jacobian = (
-            self.weighted_tracking_residual_and_jacobian(
-                control_points=control_points,
-                tracking_times=np.array([
-                    terminal_time
-                ]),
-                target_poses=[
-                    terminal_pose
-                ],
-            )
-        )
-
-        terminal_scale = np.sqrt(
-            self.lambda_terminal
-        )
-
-        residual = np.concatenate([
-            residual,
-            terminal_scale * terminal_residual,
-        ])
-
-        jacobian = np.vstack([
-            jacobian,
-            terminal_scale * terminal_jacobian,
-        ])
-
-        return residual, jacobian
-
-    def objective(
-        self,
-        control_points,
-        tracking_times,
-        target_poses,
-    ):
-        """
-        Evaluate the true nonlinear pose-tracking objective.
-
-            integral (
-                ||translation error||²
-                +
-                orientation_scale² ||rotation error||²
-            ) dt
-
-            + lambda_smooth c.T R2 c
-        """
-
-        residual, _ = (
-            self.optimization_residual_and_jacobian(
-                control_points=control_points,
-                tracking_times=tracking_times,
-                target_poses=target_poses,
-            )
-        )
-
-        c = np.asarray(
-            control_points,
-            dtype=float,
-        ).reshape(-1)
-
-        pose_cost = (
-            residual @ residual
-        )
-
-        smoothness_cost = (
-            self.lambda_smooth
-            * c
-            @ self.R2
-            @ c
-        )
-
-        return float(
-            pose_cost
-            + smoothness_cost
-        )
-
-    def cartesian_error_metrics(
-        self,
-        control_points,
-        tracking_times,
-        target_positions,
-    ):
-        residual, _ = self.residual_and_jacobian(
-            control_points=control_points,
-            tracking_times=tracking_times,
-            target_positions=target_positions,
-        )
-
-        errors = np.linalg.norm(
-            residual.reshape(-1, 3),
-            axis=1,
-        )
-
-        return {
-            "rms": float(
-                np.sqrt(
-                    np.mean(errors ** 2)
-                )
-            ),
-            "max": float(
-                np.max(errors)
-            ),
-        }
+    # =========================================================
+    # Gauss-Newton QP
+    # =========================================================
 
     def build_gauss_newton_qp(
         self,
+        problem,
         current_control_points,
-        tracking_times,
-        target_poses,
-        q0,
-        v0,
-        q_min,
-        q_max,
-        v_min,
-        v_max,
-        a_min,
-        a_max,
-        a0=None,
-        vf=None
+        *,
+        damping=None,
     ):
-        """
-        Build one constrained Gauss-Newton QP.
+        """Build one constrained Gauss-Newton QP.
 
-        Around c_i:
+        The damped model is used to compute the step.
 
-            r(c) ~= r_i + J_i (c - c_i)
-
-        We solve
-
-            min_c
-                ||r_i + J_i(c - c_i)||²
-                + lambda c.T R2 c
-                + damping ||c - c_i||²
-
-        under the original linear B-spline constraints.
+        The undamped Gauss-Newton model is returned separately
+        and is used to evaluate the gain ratio rho.
         """
 
         c_i = np.asarray(
@@ -1095,127 +659,214 @@ class CartesianTrajectoryOptimizer:
             dtype=float,
         ).reshape(-1)
 
-        # Weighted residual and Jacobian:
-        #
-        # ||r_w||² approximates
-        #
-        # integral ||r(t)||² dt
+        if damping is None:
+            damping = self.damping
 
-        r, J = (
-            self.optimization_residual_and_jacobian(
-                control_points=c_i,
-                tracking_times=tracking_times,
-                target_poses=target_poses,
+        damping = float(damping)
+
+        if damping < 0.0:
+            raise ValueError(
+                "damping must be non-negative."
             )
+
+        # ---------------------------------------------------------
+        # Residual and Jacobian at current point
+        # ---------------------------------------------------------
+
+        r, J = problem.residual_and_jacobian(
+            c_i
         )
 
         # Linearized residual:
         #
-        # r_i + J_i(c - c_i)
+        # r(c) ~= r_i + J_i (c - c_i)
+        #      = J_i c + d
         #
-        # = J_i c + d
-
         d = r - J @ c_i
 
-        # Gauss-Newton Hessian approximation
+        # =========================================================
+        # Undamped Gauss-Newton model
+        #
+        # Used only to evaluate rho.
+        # =========================================================
 
-        H = (
+        H_model = (
             J.T @ J
-            + self.lambda_smooth * self.R2
-            + self.damping * np.eye(c_i.size)
+            + problem.lambda_smooth
+            * problem.R2
         )
 
-        # OSQP uses
-        #
-        # 1/2 c.T P c + g.T c
+        P_model = 2.0 * H_model
 
-        P = 2.0 * H
-
-        # Numerical symmetrization
-        P = 0.5 * (
-            P + P.T
+        P_model = 0.5 * (
+            P_model
+            + P_model.T
         )
 
-        # Linear term:
-        #
-        # 2 J.T d
-        #
-        # plus damping
-        #
-        # -2 mu c_i
-
-        g = 2.0 * (
+        g_model = 2.0 * (
             J.T @ d
-            - self.damping * c_i
         )
 
-        P = sp.triu(
-            sp.csc_matrix(P),
+        # =========================================================
+        # Damped QP
+        #
+        # Used by OSQP to compute the step.
+        # =========================================================
+
+        H_qp = (
+            H_model
+            + damping
+            * np.eye(c_i.size)
+        )
+
+        P_qp = 2.0 * H_qp
+
+        P_qp = 0.5 * (
+            P_qp
+            + P_qp.T
+        )
+
+        g_qp = 2.0 * (
+            J.T @ d
+            - damping * c_i
+        )
+
+        # OSQP only needs upper triangular P.
+        P_osqp = sp.triu(
+            sp.csc_matrix(P_qp),
             format="csc",
         )
 
-        A, l, u = _build_joint_constraints(
-            spline=self.spline,
-            q0=q0,
-            v0=v0,
-            q_min=q_min,
-            q_max=q_max,
-            v_min=v_min,
-            v_max=v_max,
-            a_min=a_min,
-            a_max=a_max,
-            a0=a0,
-            vf=vf
+        # ---------------------------------------------------------
+        # Linear trajectory constraints
+        # ---------------------------------------------------------
+
+        A, l, u = (
+            problem.linear_constraints()
         )
 
-        return P, g, A, l, u
+        return (
+            P_osqp,
+            g_qp,
+            A,
+            l,
+            u,
+            P_model,
+            g_model,
+        )
+
+    def _qp_model_value(
+        self,
+        P,
+        g,
+        control_points,
+    ):
+        """Evaluate a full quadratic model."""
+
+        c = np.asarray(
+            control_points,
+            dtype=float,
+        ).reshape(-1)
+
+        return float(
+            0.5 * c @ P @ c
+            + g @ c
+        )
+
+    def _gain_ratio(
+        self,
+        problem,
+        current_control_points,
+        candidate_control_points,
+        P,
+        g,
+    ):
+        """Compare actual and predicted objective decrease."""
+
+        c = np.asarray(
+            current_control_points,
+            dtype=float,
+        ).reshape(-1)
+
+        candidate = np.asarray(
+            candidate_control_points,
+            dtype=float,
+        ).reshape(-1)
+
+        current_cost = problem.objective(c)
+        candidate_cost = problem.objective(
+            candidate
+        )
+
+        actual_reduction = (
+            current_cost
+            - candidate_cost
+        )
+
+        predicted_reduction = (
+            self._qp_model_value(P, g, c)
+            - self._qp_model_value(
+                P,
+                g,
+                candidate,
+            )
+        )
+
+        if predicted_reduction <= 0.0:
+            return -np.inf
+
+        return (
+            actual_reduction
+            / predicted_reduction
+        )
+    # =========================================================
+    # One Gauss-Newton step
+    # =========================================================
 
     def gauss_newton_step(
         self,
+        problem,
         current_control_points,
-        tracking_times,
-        target_poses,
-        q0,
-        v0,
-        q_min,
-        q_max,
-        v_min,
-        v_max,
-        a_min,
-        a_max,
-        a0=None,
-        vf=None,
+        *,
+        damping=None,
         verbose=False,
     ):
-        """
-        Solve one constrained Gauss-Newton QP.
+        """Solve one constrained Gauss-Newton QP.
 
-        Returns the full-step QP solution c_qp.
+        Returns
+        -------
+        c_qp :
+            Full-step QP solution.
+
+        result :
+            OSQP result object.
+
+        P_model, g_model :
+            Undamped Gauss-Newton quadratic model used
+            to evaluate the gain ratio rho.
         """
 
-        P, g, A, l, u = (
-            self.build_gauss_newton_qp(
-                current_control_points=current_control_points,
-                tracking_times=tracking_times,
-                target_poses=target_poses,
-                q0=q0,
-                v0=v0,
-                q_min=q_min,
-                q_max=q_max,
-                v_min=v_min,
-                v_max=v_max,
-                a_min=a_min,
-                a_max=a_max,
-                a0=a0,
-                vf=vf,
-            )
+        (
+            P_osqp,
+            g_qp,
+            A,
+            l,
+            u,
+            P_model,
+            g_model,
+        ) = self.build_gauss_newton_qp(
+            problem=problem,
+            current_control_points=(
+                current_control_points
+            ),
+            damping=damping,
         )
 
         solver = osqp.OSQP()
 
         solver.setup(
-            P=P,
-            q=g,
+            P=P_osqp,
+            q=g_qp,
             A=A,
             l=l,
             u=u,
@@ -1225,8 +876,10 @@ class CartesianTrajectoryOptimizer:
 
         result = solver.solve()
 
-        if not result.info.status.lower().startswith(
-            "solved"
+        if not (
+            result.info.status
+            .lower()
+            .startswith("solved")
         ):
             raise RuntimeError(
                 "Gauss-Newton QP failed: "
@@ -1239,148 +892,22 @@ class CartesianTrajectoryOptimizer:
                 dtype=float,
             ),
             result,
+            P_model,
+            g_model,
         )
 
-    def pose_error_metrics(
-        self,
-        control_points,
-        tracking_times,
-        target_poses,
-    ):
-        """
-        Report physically interpretable pose errors:
-
-            position RMS / max [m]
-            orientation RMS / max [rad]
-
-        These metrics are unweighted and are therefore independent
-        of orientation_scale.
-        """
-
-        c = np.asarray(
-            control_points,
-            dtype=float,
-        ).reshape(-1)
-
-        position_errors = []
-        orientation_errors = []
-
-        for t, target_pose in zip(
-            tracking_times,
-            target_poses,
-        ):
-            A_k = self.spline.evaluation_matrix(
-                t,
-                derivative_order=0,
-            )
-
-            theta = A_k @ c
-
-            q_pin = (
-                self.robot
-                .joint_positions_to_configuration(
-                    theta
-                )
-            )
-
-            current_pose = self.robot.frame_pose(
-                q_pin
-            )
-
-            # Euclidean translation error
-            position_error = np.linalg.norm(
-                current_pose.translation
-                - target_pose.translation
-            )
-
-            # Geodesic orientation error
-            rotation_error = (
-                current_pose.rotation.T
-                @ target_pose.rotation
-            )
-
-            orientation_error = np.linalg.norm(
-                pin.log3(
-                    rotation_error
-                )
-            )
-
-            position_errors.append(
-                position_error
-            )
-
-            orientation_errors.append(
-                orientation_error
-            )
-
-        position_errors = np.asarray(
-            position_errors
-        )
-
-        orientation_errors = np.asarray(
-            orientation_errors
-        )
-
-        return {
-            "position_rms": float(
-                np.sqrt(
-                    np.mean(
-                        position_errors ** 2
-                    )
-                )
-            ),
-            "position_max": float(
-                np.max(
-                    position_errors
-                )
-            ),
-            "orientation_rms": float(
-                np.sqrt(
-                    np.mean(
-                        orientation_errors ** 2
-                    )
-                )
-            ),
-            "orientation_max": float(
-                np.max(
-                    orientation_errors
-                )
-            ),
-        }
+    # =========================================================
+    # Solve
+    # =========================================================
 
     def solve(
         self,
-        tracking_times,
-        target_poses,
+        problem,
         initial_control_points,
-        q0,
-        v0,
-        q_min,
-        q_max,
-        v_min,
-        v_max,
-        a_min,
-        a_max,
-        a0=None,
-        vf=None,
-        max_iterations=20,
-        step_tolerance=1e-6,
-        cost_tolerance=1e-8,
-        line_search_shrink=0.5,
-        min_alpha=1e-4,
+        *,
         verbose=False,
     ):
-        """
-        Solve the nonlinear Cartesian trajectory optimization problem
-        with constrained Gauss-Newton iterations.
-
-        Each iteration:
-
-            1. linearizes the Cartesian tracking residual;
-            2. solves the constrained Gauss-Newton QP;
-            3. performs a backtracking line search;
-            4. accepts the step if the true nonlinear objective decreases.
-        """
+        """Solve the nonlinear trajectory optimization problem."""
 
         c = np.asarray(
             initial_control_points,
@@ -1389,139 +916,289 @@ class CartesianTrajectoryOptimizer:
 
         history = []
 
-        current_cost = self.objective(
-            c,
-            tracking_times,
-            target_poses,
+        current_cost = problem.objective(c)
+
+        # ---------------------------------------------------------
+        # Current damping value
+        #
+        # self.damping is the configured initial damping.
+        # mu is local to this solve and may evolve in adaptive mode.
+        # ---------------------------------------------------------
+
+        mu = float(
+            np.clip(
+                self.damping,
+                self.min_damping,
+                self.max_damping,
+            )
         )
 
         if verbose:
-            metrics = self.pose_error_metrics(
-                c,
-                tracking_times,
-                target_poses,
-            )
+            metrics = problem.error_metrics(c)
 
             print(
                 f"Initial: "
                 f"J={current_cost:.6e}  "
-                f"pos RMS={1e3 * metrics['position_rms']:.3f} mm  "
-                f"pos max={1e3 * metrics['position_max']:.3f} mm  "
-                f"ori RMS={np.degrees(metrics['orientation_rms']):.3f} deg  "
-                f"ori max={np.degrees(metrics['orientation_max']):.3f} deg"
+                f"pos RMS="
+                f"{1e3 * metrics['position_rms']:.3f} mm  "
+                f"pos max="
+                f"{1e3 * metrics['position_max']:.3f} mm  "
+                f"ori RMS="
+                f"{np.degrees(metrics['orientation_rms']):.3f} deg  "
+                f"ori max="
+                f"{np.degrees(metrics['orientation_max']):.3f} deg"
             )
 
-        for iteration in range(max_iterations):
+        # =========================================================
+        # Main Gauss-Newton iterations
+        # =========================================================
+
+        for iteration in range(
+            self.max_iterations
+        ):
 
             # -----------------------------------------------------
-            # Solve local constrained Gauss-Newton model
+            # Adaptive damping retries
+            #
+            # In static mode, this loop is executed only once.
+            #
+            # In adaptive mode, if the line search cannot find an
+            # acceptable step, mu is increased and a new QP is
+            # constructed.
             # -----------------------------------------------------
 
-            c_qp, osqp_result = self.gauss_newton_step(
-                current_control_points=c,
-                tracking_times=tracking_times,
-                target_poses=target_poses,
-                q0=q0,
-                v0=v0,
-                q_min=q_min,
-                q_max=q_max,
-                v_min=v_min,
-                v_max=v_max,
-                a_min=a_min,
-                a_max=a_max,
-                a0=a0,
-                vf=vf,
-                verbose=False,
-            )
+            retry = 0
 
-            direction = c_qp - c
+            while True:
 
-            full_step_norm = np.linalg.norm(
-                direction
-            )
+                # -------------------------------------------------
+                # Local constrained Gauss-Newton model
+                # -------------------------------------------------
 
-            # -----------------------------------------------------
-            # QP proposes essentially no movement
-            # -----------------------------------------------------
-
-            if full_step_norm <= (
-                step_tolerance
-                * (1.0 + np.linalg.norm(c))
-            ):
-                return CartesianOptimizationResult(
-                    control_points=c.reshape(
-                        self.spline.n_control_points,
-                        self.spline.n_dof,
-                    ),
-                    success=True,
-                    status="step_tolerance",
-                    iterations=iteration,
-                    history=history,
+                (
+                    c_qp,
+                    osqp_result,
+                    P_model,
+                    g_model,
+                ) = self.gauss_newton_step(
+                    problem=problem,
+                    current_control_points=c,
+                    damping=mu,
+                    verbose=False,
                 )
 
-            # -----------------------------------------------------
-            # Backtracking line search
-            #
-            # Both c and c_qp satisfy the linear constraints.
-            # Since the feasible set is convex:
-            #
-            # c + alpha (c_qp - c)
-            #
-            # remains feasible for alpha in [0, 1].
-            # -----------------------------------------------------
+                direction = c_qp - c
 
-            alpha = 1.0
-            accepted = False
-
-            while alpha >= min_alpha:
-
-                candidate = (
-                    c
-                    + alpha * direction
+                full_step_norm = np.linalg.norm(
+                    direction
                 )
 
-                candidate_cost = self.objective(
-                    candidate,
-                    tracking_times,
-                    target_poses,
-                )
+                # -------------------------------------------------
+                # QP proposes essentially no movement
+                # -------------------------------------------------
 
-                if candidate_cost < current_cost:
-                    accepted = True
+                if full_step_norm <= (
+                    self.step_tolerance
+                    * (
+                        1.0
+                        + np.linalg.norm(c)
+                    )
+                ):
+                    return CartesianOptimizationResult(
+                        control_points=(
+                            c.reshape(
+                                problem.spline.n_control_points,
+                                problem.spline.n_dof,
+                            )
+                        ),
+                        success=True,
+                        status="step_tolerance",
+                        iterations=iteration,
+                        history=history,
+                    )
+
+                # -------------------------------------------------
+                # Backtracking line search
+                #
+                # c and c_qp are feasible.
+                #
+                # Since the current constraints are linear, the
+                # feasible set is convex. Therefore
+                #
+                #     c + alpha * (c_qp - c)
+                #
+                # remains feasible for alpha in [0, 1].
+                # -------------------------------------------------
+
+                alpha = 1.0
+                accepted = False
+
+                while alpha >= self.min_alpha:
+
+                    candidate = (
+                        c
+                        + alpha * direction
+                    )
+
+                    candidate_cost = (
+                        problem.objective(
+                            candidate
+                        )
+                    )
+
+                    if candidate_cost < current_cost:
+                        accepted = True
+                        break
+
+                    alpha *= (
+                        self.line_search_shrink
+                    )
+
+                # -------------------------------------------------
+                # Successful line search
+                # -------------------------------------------------
+
+                if accepted:
+
+                    rho = self._gain_ratio(
+                        problem=problem,
+                        current_control_points=c,
+                        candidate_control_points=candidate,
+                        P=P_model,
+                        g=g_model,
+                    )
+
                     break
 
-                alpha *= line_search_shrink
+                # -------------------------------------------------
+                # Line search failed
+                #
+                # Static mode:
+                # preserve the previous solver behaviour.
+                # -------------------------------------------------
 
-            if not accepted:
-                return CartesianOptimizationResult(
-                    control_points=c.reshape(
-                        self.spline.n_control_points,
-                        self.spline.n_dof,
-                    ),
-                    success=False,
-                    status="line_search_failed",
-                    iterations=iteration,
-                    history=history,
+                if self.damping_mode == "static":
+
+                    return CartesianOptimizationResult(
+                        control_points=(
+                            c.reshape(
+                                problem.spline.n_control_points,
+                                problem.spline.n_dof,
+                            )
+                        ),
+                        success=False,
+                        status="line_search_failed",
+                        iterations=iteration,
+                        history=history,
+                    )
+
+                # -------------------------------------------------
+                # Adaptive mode:
+                #
+                # The current Gauss-Newton model was too
+                # aggressive. Increase damping and rebuild the QP.
+                # -------------------------------------------------
+
+                if retry >= self.max_damping_retries:
+
+                    return CartesianOptimizationResult(
+                        control_points=(
+                            c.reshape(
+                                problem.spline.n_control_points,
+                                problem.spline.n_dof,
+                            )
+                        ),
+                        success=False,
+                        status="damping_limit",
+                        iterations=iteration,
+                        history=history,
+                    )
+
+                new_mu = float(
+                    min(
+                        mu * self.damping_increase,
+                        self.max_damping,
+                    )
+                )
+
+                # We cannot increase damping any further.
+                if new_mu <= mu:
+
+                    return CartesianOptimizationResult(
+                        control_points=(
+                            c.reshape(
+                                problem.spline.n_control_points,
+                                problem.spline.n_dof,
+                            )
+                        ),
+                        success=False,
+                        status="damping_limit",
+                        iterations=iteration,
+                        history=history,
+                    )
+
+                retry += 1
+                mu = new_mu
+
+                if verbose:
+                    print(
+                        f"     line search failed -> "
+                        f"increasing damping to "
+                        f"mu={mu:.3e} "
+                        f"(retry {retry}/"
+                        f"{self.max_damping_retries})"
+                    )
+
+            # =====================================================
+            # A step has been accepted
+            # =====================================================
+
+            previous_cost = current_cost
+
+            step_norm = (
+                alpha
+                * full_step_norm
+            )
+
+            # -----------------------------------------------------
+            # Update adaptive damping
+            #
+            # rho compares:
+            #
+            #   actual objective decrease
+            #
+            # with:
+            #
+            #   decrease predicted by the local quadratic model.
+            # -----------------------------------------------------
+
+            if self.damping_mode == "adaptive":
+
+                if rho < self.rho_low:
+                    mu *= self.damping_increase
+
+                elif (
+                    rho > self.rho_high
+                    and alpha == 1.0
+                ):
+                    mu /= self.damping_decrease
+
+                mu = float(
+                    np.clip(
+                        mu,
+                        self.min_damping,
+                        self.max_damping,
+                    )
                 )
 
             # -----------------------------------------------------
             # Accept step
             # -----------------------------------------------------
 
-            previous_cost = current_cost
-
             c = candidate
             current_cost = candidate_cost
 
-            step_norm = (
-                alpha * full_step_norm
-            )
-
-            metrics = self.pose_error_metrics(
-                c,
-                tracking_times,
-                target_poses,
-            )
+            metrics = problem.error_metrics(c)
 
             history.append(
                 CartesianIteration(
@@ -1531,6 +1208,7 @@ class CartesianTrajectoryOptimizer:
                     position_rms=metrics[
                         "position_rms"
                     ],
+
                     position_max=metrics[
                         "position_max"
                     ],
@@ -1538,6 +1216,7 @@ class CartesianTrajectoryOptimizer:
                     orientation_rms=metrics[
                         "orientation_rms"
                     ],
+
                     orientation_max=metrics[
                         "orientation_max"
                     ],
@@ -1556,38 +1235,61 @@ class CartesianTrajectoryOptimizer:
             )
 
             if verbose:
-                print(
-                    f"[{iteration:02d}] "
-                    f"J={current_cost:.6e}  "
-                    f"pos RMS="
-                    f"{1e3 * metrics['position_rms']:.3f} mm  "
-                    f"ori RMS="
-                    f"{np.degrees(metrics['orientation_rms']):.3f} deg  "
-                    f"|step|={step_norm:.3e}  "
-                    f"alpha={alpha:.3f}"
-                )
+                if self.damping_mode == "adaptive":
+                    print(
+                        f"[{iteration:02d}] "
+                        f"J={current_cost:.6e}  "
+                        f"pos RMS="
+                        f"{1e3 * metrics['position_rms']:.3f} mm  "
+                        f"ori RMS="
+                        f"{np.degrees(metrics['orientation_rms']):.3f} deg  "
+                        f"|step|={step_norm:.3e}  "
+                        f"alpha={alpha:.3f}  "
+                        f"rho={rho:.3f}  "
+                        f"mu={mu:.3e}  "
+                        f"retry={retry}"
+                    )
+
+                else:
+                    print(
+                        f"[{iteration:02d}] "
+                        f"J={current_cost:.6e}  "
+                        f"pos RMS="
+                        f"{1e3 * metrics['position_rms']:.3f} mm  "
+                        f"ori RMS="
+                        f"{np.degrees(metrics['orientation_rms']):.3f} deg  "
+                        f"|step|={step_norm:.3e}  "
+                        f"alpha={alpha:.3f}"
+                    )
 
             # -----------------------------------------------------
-            # Convergence based on accepted step
+            # Step convergence
             # -----------------------------------------------------
 
             if step_norm <= (
-                step_tolerance
-                * (1.0 + np.linalg.norm(c))
+                self.step_tolerance
+                * (
+                    1.0
+                    + np.linalg.norm(c)
+                )
             ):
                 return CartesianOptimizationResult(
-                    control_points=c.reshape(
-                        self.spline.n_control_points,
-                        self.spline.n_dof,
+                    control_points=(
+                        c.reshape(
+                            problem.spline.n_control_points,
+                            problem.spline.n_dof,
+                        )
                     ),
                     success=True,
                     status="step_tolerance",
-                    iterations=iteration + 1,
+                    iterations=(
+                        iteration + 1
+                    ),
                     history=history,
                 )
 
             # -----------------------------------------------------
-            # Convergence based on relative objective decrease
+            # Objective convergence
             # -----------------------------------------------------
 
             relative_decrease = (
@@ -1598,248 +1300,38 @@ class CartesianTrajectoryOptimizer:
                 1e-12,
             )
 
-            if relative_decrease <= cost_tolerance:
+            if (
+                relative_decrease
+                <= self.cost_tolerance
+            ):
                 return CartesianOptimizationResult(
-                    control_points=c.reshape(
-                        self.spline.n_control_points,
-                        self.spline.n_dof,
+                    control_points=(
+                        c.reshape(
+                            problem.spline.n_control_points,
+                            problem.spline.n_dof,
+                        )
                     ),
                     success=True,
                     status="cost_tolerance",
-                    iterations=iteration + 1,
+                    iterations=(
+                        iteration + 1
+                    ),
                     history=history,
                 )
 
+        # =========================================================
+        # Maximum number of iterations reached
+        # =========================================================
+
         return CartesianOptimizationResult(
-            control_points=c.reshape(
-                self.spline.n_control_points,
-                self.spline.n_dof,
+            control_points=(
+                c.reshape(
+                    problem.spline.n_control_points,
+                    problem.spline.n_dof,
+                )
             ),
             success=False,
             status="max_iterations",
-            iterations=max_iterations,
+            iterations=self.max_iterations,
             history=history,
-        )
-
-    def pose_residual_and_jacobian(
-        self,
-        control_points,
-        tracking_times,
-        target_poses,
-    ):
-        """
-        Compute the full SE(3) pose residual and its analytical
-        Jacobian with respect to the B-spline control points.
-
-        For each sample:
-
-            theta_k = A_k c
-
-            M_error = M(theta_k)^(-1) M_ref,k
-
-            e_k = log6(M_error)
-
-        and
-
-            de_k / dc
-                = de_k / dtheta_k * A_k.
-
-        Pinocchio's LOCAL frame Jacobian is used because the
-        SE(3) log residual is expressed in the local tangent space.
-        """
-
-        tracking_times = np.asarray(
-            tracking_times,
-            dtype=float,
-        ).reshape(-1)
-
-        if len(target_poses) != len(tracking_times):
-            raise ValueError(
-                "target_poses must have the same length "
-                "as tracking_times."
-            )
-
-        c = np.asarray(
-            control_points,
-            dtype=float,
-        ).reshape(-1)
-
-        n_variables = (
-            self.spline.n_control_points
-            * self.spline.n_dof
-        )
-
-        if c.size != n_variables:
-            raise ValueError(
-                f"Expected {n_variables} control-point values, "
-                f"got {c.size}."
-            )
-
-        residual = np.empty(
-            6 * len(tracking_times)
-        )
-
-        jacobian = np.empty(
-            (
-                6 * len(tracking_times),
-                n_variables,
-            )
-        )
-
-        for k, t in enumerate(
-            tracking_times
-        ):
-
-            # ---------------------------------------------------------
-            # B-spline:
-            #
-            # theta(t) = A_k c
-            # ---------------------------------------------------------
-
-            A_k = self.spline.evaluation_matrix(
-                t,
-                derivative_order=0,
-            )
-
-            theta = A_k @ c
-
-            q_pin = (
-                self.robot
-                .joint_positions_to_configuration(
-                    theta
-                )
-            )
-
-            # ---------------------------------------------------------
-            # Current and desired end-effector poses
-            # ---------------------------------------------------------
-
-            current_pose = self.robot.frame_pose(
-                q_pin
-            )
-
-            target_pose = target_poses[k]
-
-            # Pose of the target expressed in the current
-            # end-effector frame:
-            #
-            #     M_error = M_current^{-1} M_target
-            # ---------------------------------------------------------
-
-            error_pose = current_pose.actInv(
-                target_pose
-            )
-
-            error = pin.log6(
-                error_pose
-            ).vector
-
-            # ---------------------------------------------------------
-            # LOCAL geometric frame Jacobian
-            # ---------------------------------------------------------
-
-            J_frame = self.robot.frame_jacobian(
-                q_pin,
-                reference_frame=pin.LOCAL,
-            )
-
-            # ---------------------------------------------------------
-            # Derivative of
-            #
-            # log6(M_current^{-1} M_target)
-            #
-            # with respect to joint tangent coordinates.
-            #
-            # This is the same differential used in a standard
-            # Pinocchio SE(3) IK formulation.
-            # ---------------------------------------------------------
-
-            J_error_theta = (
-                -pin.Jlog6(
-                    error_pose.inverse()
-                )
-                @ J_frame
-            )
-
-            # Chain rule:
-            #
-            # de / dc
-            #     = de / dtheta
-            #       dtheta / dc
-            # ---------------------------------------------------------
-
-            J_error_control_points = (
-                J_error_theta @ A_k
-            )
-
-            row = slice(
-                6 * k,
-                6 * (k + 1),
-            )
-
-            residual[row] = error
-
-            jacobian[row, :] = (
-                J_error_control_points
-            )
-
-        return residual, jacobian
-
-    def weighted_pose_residual_and_jacobian(
-        self,
-        control_points,
-        tracking_times,
-        target_poses,
-    ):
-        """
-        Apply spatial weighting and trapezoidal time quadrature.
-
-        orientation_scale has units of meters / radian.
-
-        The resulting least-squares norm behaves approximately as
-
-            ||translation error||²
-            +
-            orientation_scale² ||rotation error||².
-        """
-
-        residual, jacobian = (
-            self.pose_residual_and_jacobian(
-                control_points=control_points,
-                tracking_times=tracking_times,
-                target_poses=target_poses,
-            )
-        )
-
-        weights = _trapezoidal_weights(
-            tracking_times
-        )
-
-        spatial_scale = np.array([
-            1.0,
-            1.0,
-            1.0,
-            self.orientation_scale,
-            self.orientation_scale,
-            self.orientation_scale,
-        ])
-
-        sample_scale = np.tile(
-            spatial_scale,
-            len(tracking_times),
-        )
-
-        time_scale = np.repeat(
-            np.sqrt(weights),
-            6,
-        )
-
-        total_scale = (
-            sample_scale
-            * time_scale
-        )
-
-        return (
-            total_scale * residual,
-            total_scale[:, None] * jacobian,
         )
