@@ -410,6 +410,77 @@ class CartesianTrajectoryProblem:
             )
 
     # =========================================================
+    # Problem update (MPC)
+    # =========================================================
+
+    def update(self, q0, v0, target_poses):
+        """Update time-varying problem data without rebuilding caches.
+
+        The spline, tracking grid, joint limits, and optional
+        boundary constraint structure remain unchanged.
+        """
+
+        n_dof = self.spline.n_dof
+
+        q0 = np.asarray(q0, dtype=float).reshape(-1).copy()
+        v0 = np.asarray(v0, dtype=float).reshape(-1).copy()
+        target_poses = list(target_poses)
+
+        # Validate before modifying the problem
+        if q0.size != n_dof or v0.size != n_dof:
+            raise ValueError(
+                f"q0 and v0 must contain {n_dof} values."
+            )
+
+        if not np.all(np.isfinite(q0)) or not np.all(np.isfinite(v0)):
+            raise ValueError("q0 and v0 must be finite.")
+
+        if len(target_poses) != len(self.tracking_times):
+            raise ValueError(
+                "target_poses and tracking_times "
+                "must have the same length."
+            )
+
+        for pose in target_poses:
+            if not (
+                hasattr(pose, "translation")
+                and hasattr(pose, "rotation")
+            ):
+                raise TypeError(
+                    "target_poses must contain SE(3)-like poses."
+                )
+
+        # Copy poses to avoid external mutation of cached data
+        target_poses = [
+            pin.SE3(
+                np.asarray(pose.rotation).copy(),
+                np.asarray(pose.translation).copy(),
+            )
+            for pose in target_poses
+        ]
+
+        target_positions = np.asarray([
+            pose.translation.copy()
+            for pose in target_poses
+        ])
+
+        # Update initial conditions
+        self.q0 = q0
+        self.v0 = v0
+
+        # The first two blocks of the joint constraints
+        # correspond to q(0) = q0 and dq(0) = v0.
+        self._l_static[:n_dof] = q0
+        self._u_static[:n_dof] = q0
+
+        self._l_static[n_dof:2*n_dof] = v0
+        self._u_static[n_dof:2*n_dof] = v0
+
+        # Update Cartesian reference
+        self.target_poses = target_poses
+        self._target_positions = target_positions
+
+    # =========================================================
     # Constraints
     # =========================================================
 
