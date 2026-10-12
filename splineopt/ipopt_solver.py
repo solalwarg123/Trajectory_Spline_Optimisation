@@ -13,15 +13,24 @@ The problem is expected to provide:
     error_metrics(c)
     spline
 
-The first implementation supports linear constraints only:
+It may additionally provide nonlinear constraints through:
 
-    l <= A c <= u
+    nonlinear_constraints(c)
+    nonlinear_constraints_jacobian(c)
+    nonlinear_constraint_bounds()
+
+The complete constraint vector is then
+
+    g(c) = [A c, g_nonlinear(c)]
+
+with corresponding lower and upper bounds.
 
 IPOPT uses a limited-memory BFGS approximation of the Hessian,
 so no exact second derivatives are required.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
 from time import perf_counter
 
 import numpy as np
@@ -49,22 +58,38 @@ class IpoptOptimizationResult:
     solve_time: float
 
     raw_info: dict
+    objective_history: list = field(
+        default_factory=list
+    )
 
 
 class _CyIpoptAdapter:
-    """Translate the internal problem interface to CyIpopt callbacks."""
+    """Translate the internal problem interface to CyIpopt callbacks.
+
+    The problem may provide:
+
+        - static linear constraints
+
+              l <= A x <= u
+
+        - optional nonlinear constraints
+
+              g_lower <= g(x) <= g_upper
+
+    The nonlinear constraint interface is optional so that
+    old/simple optimization problems remain supported.
+    """
 
     def __init__(
         self,
         problem,
     ):
         self.problem = problem
+        self.objective_history = []
 
-        # -----------------------------------------------------
+        # =====================================================
         # Linear constraints
-        #
-        #     l <= A c <= u
-        # -----------------------------------------------------
+        # =====================================================
 
         A, l, u = (
             problem.linear_constraints()
@@ -75,18 +100,18 @@ class _CyIpoptAdapter:
 
         self.A = A
 
-        self.constraint_lower = np.asarray(
+        self.linear_lower = np.asarray(
             l,
             dtype=float,
         ).reshape(-1)
 
-        self.constraint_upper = np.asarray(
+        self.linear_upper = np.asarray(
             u,
             dtype=float,
         ).reshape(-1)
 
         if self.A.shape[0] != (
-            self.constraint_lower.size
+            self.linear_lower.size
         ):
             raise ValueError(
                 "Constraint matrix and lower bounds "
@@ -94,35 +119,200 @@ class _CyIpoptAdapter:
             )
 
         if self.A.shape[0] != (
-            self.constraint_upper.size
+            self.linear_upper.size
         ):
             raise ValueError(
                 "Constraint matrix and upper bounds "
                 "have incompatible dimensions."
             )
 
-        # Sparse Jacobian structure is constant because
-        # current constraints are linear.
-        self._jacobian_rows = (
+        self.n_variables = (
+            self.A.shape[1]
+        )
+
+        self.n_linear_constraints = (
+            self.A.shape[0]
+        )
+
+        # =====================================================
+        # Optional nonlinear constraints
+        # =====================================================
+
+        has_values = hasattr(
+            problem,
+            "nonlinear_constraints",
+        )
+
+        has_jacobian = hasattr(
+            problem,
+            "nonlinear_constraints_jacobian",
+        )
+
+        has_bounds = hasattr(
+            problem,
+            "nonlinear_constraint_bounds",
+        )
+
+        nonlinear_interface_count = sum([
+            has_values,
+            has_jacobian,
+            has_bounds,
+        ])
+
+        if nonlinear_interface_count not in {
+            0,
+            3,
+        }:
+            raise AttributeError(
+                "A problem with nonlinear constraints must "
+                "provide all three methods: "
+                "nonlinear_constraints(c), "
+                "nonlinear_constraints_jacobian(c), and "
+                "nonlinear_constraint_bounds()."
+            )
+
+        self.has_nonlinear_constraints = (
+            nonlinear_interface_count == 3
+        )
+
+        if self.has_nonlinear_constraints:
+
+            nonlinear_lower, nonlinear_upper = (
+                problem
+                .nonlinear_constraint_bounds()
+            )
+
+            self.nonlinear_lower = np.asarray(
+                nonlinear_lower,
+                dtype=float,
+            ).reshape(-1)
+
+            self.nonlinear_upper = np.asarray(
+                nonlinear_upper,
+                dtype=float,
+            ).reshape(-1)
+
+        else:
+
+            self.nonlinear_lower = np.empty(
+                0,
+                dtype=float,
+            )
+
+            self.nonlinear_upper = np.empty(
+                0,
+                dtype=float,
+            )
+
+        if (
+            self.nonlinear_lower.size
+            != self.nonlinear_upper.size
+        ):
+            raise ValueError(
+                "Nonlinear lower and upper bounds "
+                "have incompatible dimensions."
+            )
+
+        self.n_nonlinear_constraints = (
+            self.nonlinear_lower.size
+        )
+
+        # =====================================================
+        # Complete constraint bounds
+        # =====================================================
+
+        self.constraint_lower = np.concatenate([
+            self.linear_lower,
+            self.nonlinear_lower,
+        ])
+
+        self.constraint_upper = np.concatenate([
+            self.linear_upper,
+            self.nonlinear_upper,
+        ])
+
+        # =====================================================
+        # Linear Jacobian structure
+        # =====================================================
+
+        self._linear_jacobian_rows = (
             self.A.row.astype(
                 np.int32,
                 copy=False,
             )
         )
 
-        self._jacobian_cols = (
+        self._linear_jacobian_cols = (
             self.A.col.astype(
                 np.int32,
                 copy=False,
             )
         )
 
-        self._jacobian_values = (
+        self._linear_jacobian_values = (
             self.A.data.astype(
                 float,
                 copy=False,
             )
         )
+
+        # =====================================================
+        # Nonlinear Jacobian structure
+        # =====================================================
+        #
+        # CyIpopt requires a FIXED sparsity structure.
+        #
+        # For now we deliberately expose a dense structure for
+        # the nonlinear block:
+        #
+        #     dg_nonlinear / dx
+        #
+        # This is robust and solver-independent. Later, if needed
+        # for MPC/offline performance, it can be replaced by the
+        # exact local B-spline sparsity pattern.
+        # =====================================================
+
+        if self.n_nonlinear_constraints > 0:
+
+            nonlinear_rows = np.repeat(
+                np.arange(
+                    self.n_nonlinear_constraints,
+                    dtype=np.int32,
+                ),
+                self.n_variables,
+            )
+
+            nonlinear_rows += (
+                self.n_linear_constraints
+            )
+
+            nonlinear_cols = np.tile(
+                np.arange(
+                    self.n_variables,
+                    dtype=np.int32,
+                ),
+                self.n_nonlinear_constraints,
+            )
+
+            self._jacobian_rows = np.concatenate([
+                self._linear_jacobian_rows,
+                nonlinear_rows,
+            ])
+
+            self._jacobian_cols = np.concatenate([
+                self._linear_jacobian_cols,
+                nonlinear_cols,
+            ])
+
+        else:
+
+            self._jacobian_rows = (
+                self._linear_jacobian_rows
+            )
+
+            self._jacobian_cols = (
+                self._linear_jacobian_cols
+            )
 
         # Updated through IPOPT's intermediate callback.
         self.iteration_count = 0
@@ -164,10 +354,37 @@ class _CyIpoptAdapter:
         self,
         x,
     ):
-        return np.asarray(
+        linear_values = np.asarray(
             self.A @ x,
             dtype=float,
         ).reshape(-1)
+
+        if (
+            self.n_nonlinear_constraints
+            == 0
+        ):
+            return linear_values
+
+        nonlinear_values = np.asarray(
+            self.problem
+            .nonlinear_constraints(
+                x
+            ),
+            dtype=float,
+        ).reshape(-1)
+
+        if nonlinear_values.size != (
+            self.n_nonlinear_constraints
+        ):
+            raise ValueError(
+                "problem.nonlinear_constraints() "
+                "returned an invalid shape."
+            )
+
+        return np.concatenate([
+            linear_values,
+            nonlinear_values,
+        ])
 
     def jacobianstructure(
         self,
@@ -181,16 +398,74 @@ class _CyIpoptAdapter:
         self,
         x,
     ):
-        # Linear constraints:
+        # -----------------------------------------------------
+        # No nonlinear constraints:
         #
-        #     g(x) = A x
+        # exactly the historical behavior.
+        # -----------------------------------------------------
+
+        if (
+            self.n_nonlinear_constraints
+            == 0
+        ):
+            return (
+                self._linear_jacobian_values
+            )
+
+        # -----------------------------------------------------
+        # Nonlinear Jacobian
+        # -----------------------------------------------------
+
+        J_nonlinear = (
+            self.problem
+            .nonlinear_constraints_jacobian(
+                x
+            )
+        )
+
+        if sp.issparse(
+            J_nonlinear
+        ):
+            J_nonlinear = (
+                J_nonlinear.toarray()
+            )
+        else:
+            J_nonlinear = np.asarray(
+                J_nonlinear,
+                dtype=float,
+            )
+
+        expected_shape = (
+            self.n_nonlinear_constraints,
+            self.n_variables,
+        )
+
+        if J_nonlinear.shape != (
+            expected_shape
+        ):
+            raise ValueError(
+                "problem."
+                "nonlinear_constraints_jacobian() "
+                "returned shape "
+                f"{J_nonlinear.shape}, "
+                f"expected {expected_shape}."
+            )
+
+        # Must use the exact same ordering as the dense
+        # row/column structure created in __init__:
         #
-        # therefore:
-        #
-        #     dg/dx = A
-        #
-        # The Jacobian does not depend on x.
-        return self._jacobian_values
+        # row 0, all columns
+        # row 1, all columns
+        # ...
+        nonlinear_values = (
+            J_nonlinear
+            .reshape(-1)
+        )
+
+        return np.concatenate([
+            self._linear_jacobian_values,
+            nonlinear_values,
+        ])
 
     # =========================================================
     # Iteration callback
@@ -212,6 +487,10 @@ class _CyIpoptAdapter:
     ):
         self.iteration_count = int(
             iter_count
+        )
+
+        self.objective_history.append(
+            float(obj_value)
         )
 
         return True
@@ -503,4 +782,7 @@ class IpoptSolver:
             ),
 
             raw_info=info,
+            objective_history=(
+                adapter.objective_history.copy()
+            ),
         )

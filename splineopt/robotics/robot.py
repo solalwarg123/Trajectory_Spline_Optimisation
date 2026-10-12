@@ -550,3 +550,91 @@ class Robot:
             f"end_effector={self.end_effector_frame!r}"
             f")"
         )
+
+    def frame_kinematics(
+        self,
+        q,
+        frames,
+        reference_frame=pin.LOCAL_WORLD_ALIGNED,
+    ):
+        """Compute positions and Jacobians of several frames efficiently.
+
+        A single Pinocchio forward-kinematics / Jacobian update is
+        performed for all requested frames.
+
+        Parameters
+        ----------
+        q :
+            Pinocchio configuration vector.
+
+        frames :
+            Iterable of frame names.
+
+        reference_frame :
+            Pinocchio Jacobian reference frame.
+
+        Returns
+        -------
+        dict
+            Mapping
+
+                frame_name -> (position, jacobian)
+
+            where position has shape (3,) and jacobian has shape (6, nv).
+        """
+
+        q = self._check_configuration(q)
+
+        frame_names = list(
+            dict.fromkeys(frames)
+        )
+
+        pin.forwardKinematics(
+            self.model,
+            self.data,
+            q,
+        )
+
+        pin.computeJointJacobians(
+            self.model,
+            self.data,
+            q,
+        )
+
+        pin.updateFramePlacements(
+            self.model,
+            self.data,
+        )
+
+        result = {}
+
+        for frame_name in frame_names:
+
+            frame_id = self.frame_id(
+                frame_name
+            )
+
+            position = (
+                self.data.oMf[
+                    frame_id
+                ]
+                .translation
+                .copy()
+            )
+
+            jacobian = (
+                pin.getFrameJacobian(
+                    self.model,
+                    self.data,
+                    frame_id,
+                    reference_frame,
+                )
+                .copy()
+            )
+
+            result[frame_name] = (
+                position,
+                jacobian,
+            )
+
+        return result
