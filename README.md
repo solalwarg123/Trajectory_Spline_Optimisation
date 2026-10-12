@@ -664,6 +664,24 @@ A small benchmark was conducted on five Kinova Gen3 trajectory scenarios with in
 IPOPT with a limited-memory BFGS Hessian approximation reaches slightly better final solutions when allowed to run for many iterations, especially for orientation tracking and the most constrained scenarios. However, this comes at a much larger computational cost: IPOPT with 200 iterations takes about 25 s on the current benchmark, compared with about 3.5 s for Gauss-Newton. With only 20 iterations, IPOPT is faster than Gauss-Newton but remains significantly less accurate, showing that the specialized Gauss-Newton formulation exploits the least-squares structure of the problem more efficiently during the first iterations.
 
 These results motivate keeping Gauss-Newton as the main specialized solver while using IPOPT as a more general nonlinear optimization baseline. The next step is to extend the formulation with nonlinear collision-avoidance constraints.
+
+### Online Cartesian MPC
+
+The project now supports receding-horizon Cartesian trajectory
+tracking using B-spline optimization.
+
+The MPC updates the initial robot state and the Cartesian
+reference at each control step, reusing the previous solution
+as a warm start.
+
+A Kinova Gen3 simulation demonstrates closed-loop SE(3)
+tracking under bounded acceleration disturbances, with
+joint position, velocity and acceleration constraints.
+
+Run the example:
+
+```powershell
+python -m examples.kinova_mpc_safe_tracking --mode gaussian --noise-accel-std 0.05 --max-iterations 2 --no-animation --show-plots
 ---
 
 
