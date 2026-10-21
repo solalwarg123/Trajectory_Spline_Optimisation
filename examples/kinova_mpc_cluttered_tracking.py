@@ -1,27 +1,29 @@
 
 """
-Kinova Gen3 — Cluttered Cartesian MPC benchmark.
+Kinova Gen3 - Cartesian MPC benchmark (Phase 1).
 
-Compare:
-    OPEN      : no feedback
-    FREE-GN2  : Cartesian MPC, two GN iterations
-    FREE-GN5  : Cartesian MPC, five GN iterations
-    SAFE-GN2  : collision-aware MPC, two GN iterations
-    SAFE-GN5  : collision-aware MPC, five GN iterations
+Experiments:
+    OPEN       : open-loop reference execution
+    FREE-GN2   : MPC without collision constraints
+    FREE-GN5
+    SAFE-GN2   : collision-aware MPC
+    SAFE-GN5
 
-Warm-start feasibility restoration is handled internally
-by splineopt.mpc.CartesianMPC.
+Features:
+    - Native warm-start rebasing and OSQP projection
+    - Final GN solution acceptance diagnostics
+    - Collision activation and feasibility checks
+    - Detailed cycle-by-cycle printing
+    - CSV exports and diagnostic plots
 
 Run:
-    python -m examples.kinova_mpc_cluttered_tracking \
-        --gn-iters 2 5 --noise-std 0.35 --show-plots
+    python -m examples.kinova_mpc_cluttered_tracking
 
     python -m examples.kinova_mpc_cluttered_tracking \
         --gn-iters 2 5 --noise-std 0.35 --debug-projection
 
     python -m examples.kinova_mpc_cluttered_tracking \
-        --gn-iters 2 5 --noise-std 0.35 \
-        --no-project-warm-start
+        --gn-iters 2 5 --show-plots
 """
 
 import argparse
@@ -73,31 +75,35 @@ from examples.kinova_trajectory_projection import (
 
 
 # ============================================================
-# Utilities
+# General utilities
 # ============================================================
 
 def rms(values):
-    x = np.asarray(values, dtype=float)
-    return (
-        float(np.sqrt(np.mean(x**2)))
-        if x.size else np.nan
-    )
+    a = np.asarray(values, dtype=float)
+    a = a[np.isfinite(a)]
+    return float(np.sqrt(np.mean(a**2))) if a.size else np.nan
 
 
 def unit(x):
     x = np.asarray(x, dtype=float)
-    norm = np.linalg.norm(x)
-    return x / max(norm, 1e-12)
+    return x / max(np.linalg.norm(x), 1e-12)
+
+
+def finite_values(rows, key):
+    values = np.asarray(
+        [r.get(key, np.nan) for r in rows],
+        dtype=float,
+    )
+    return values[np.isfinite(values)]
 
 
 def linear_violation(problem, control_points):
     A, lower, upper = problem.linear_constraints()
-
-    x = np.asarray(
-        control_points, dtype=float
-    ).reshape(-1)
-
+    x = np.asarray(control_points, dtype=float).reshape(-1)
     values = np.asarray(A @ x).reshape(-1)
+
+    if not np.all(np.isfinite(values)):
+        return np.inf
 
     return float(max(
         0.0,
@@ -106,20 +112,17 @@ def linear_violation(problem, control_points):
     ))
 
 
-def print_linear_failure(problem, c):
+def print_linear_failure(problem, control_points):
     A, lower, upper = problem.linear_constraints()
-
-    values = np.asarray(
-        A @ np.asarray(c).reshape(-1)
-    ).reshape(-1)
+    x = np.asarray(control_points).reshape(-1)
+    values = np.asarray(A @ x).reshape(-1)
 
     violations = np.maximum(
         np.maximum(lower - values, 0.0),
         np.maximum(values - upper, 0.0),
     )
 
-    order = np.argsort(violations)[::-1][:5]
-
+    order = np.argsort(violations)[::-1][:8]
     n = problem.spline.n_dof
     m = problem.spline.n_control_points
 
@@ -127,51 +130,31 @@ def print_linear_failure(problem, c):
     pos_end = n_eq + m * n
     vel_end = pos_end + (m - 1) * n
 
-    print("\nLINEAR CONSTRAINT DIAGNOSTICS")
+    print("\n" + "-" * 75)
+    print("LINEAR CONSTRAINT FAILURE")
+    print("-" * 75)
 
-    for index in order:
-        violation = violations[index]
-
-        if violation <= 1e-10:
+    for i in order:
+        if violations[i] <= 1e-10:
             continue
 
-        if index < n:
-            family = "initial_position"
-            joint = index
-            cp = 0
-
-        elif index < n_eq:
-            family = "initial_velocity"
-            joint = index - n
-            cp = 0
-
-        elif index < pos_end:
-            offset = index - n_eq
-            family = "position"
-            joint = offset % n
-            cp = offset // n
-
-        elif index < vel_end:
-            offset = index - pos_end
-            family = "velocity"
-            joint = offset % n
-            cp = offset // n
-
+        if i < n:
+            family, joint = "q0", i
+        elif i < n_eq:
+            family, joint = "v0", i - n
+        elif i < pos_end:
+            family, joint = "position", (i - n_eq) % n
+        elif i < vel_end:
+            family, joint = "velocity", (i - pos_end) % n
         else:
-            offset = index - vel_end
-            family = "acceleration"
-            joint = offset % n
-            cp = offset // n
+            family, joint = "acceleration", (i - vel_end) % n
 
         print(
-            f"  row={index} | "
-            f"{family} | "
-            f"joint={joint + 1} | "
-            f"cp={cp} | "
-            f"value={values[index]:.6f} | "
-            f"lower={lower[index]:.6f} | "
-            f"upper={upper[index]:.6f} | "
-            f"violation={violation:.6e}"
+            f"Row {i:4d} | {family:14s} | "
+            f"Joint {joint + 1} | "
+            f"value={values[i]: .6f} | "
+            f"bounds=[{lower[i]: .6f}, {upper[i]: .6f}] | "
+            f"violation={violations[i]:.3e}"
         )
 
 
@@ -188,9 +171,6 @@ def make_environment(robot, obstacles):
 
 
 def obstacle_clearances(environment, q):
-    if environment.n_obstacles == 0:
-        return np.empty(0)
-
     distances, _ = environment.evaluate(
         q,
         compute_jacobian=False,
@@ -204,126 +184,92 @@ def obstacle_clearances(environment, q):
 
 def reference_clearances(environment, times):
     return np.asarray([
-        obstacle_clearances(
-            environment,
-            reference_state(t)[0],
-        )
+        obstacle_clearances(environment, reference_state(t)[0])
         for t in times
     ])
 
 
-def get_capsule(name):
-    for capsule in KINOVA_CAPSULES:
-        if capsule.name == name:
-            return capsule
-
-    raise ValueError(
-        f"Unknown capsule: {name}"
-    )
-
-
 def capsule_midpoint(robot, q, capsule):
-    p0, p1 = capsule_endpoints(
-        robot, q, capsule
-    )
+    p0, p1 = capsule_endpoints(robot, q, capsule)
     return 0.5 * (p0 + p1)
 
 
-# ============================================================
-# Feasible static obstacle placement
-# ============================================================
-
 def generate_obstacles(robot, args):
     """
-    Generate spheres close to, but not intersecting,
-    the nominal joint-space reference trajectory.
-    """
+    Place static spheres near the nominal trajectory.
 
+    The nominal trajectory remains collision-feasible.
+    """
     anchor_times = np.linspace(
         2.5, 7.5, args.n_obstacles
     )
-
-    desired_clearances = np.linspace(
+    targets = np.linspace(
         args.nominal_clearance_min,
         args.nominal_clearance_max,
         args.n_obstacles,
     )
 
     sample_times = np.linspace(
-        0.0,
-        DURATION,
-        args.placement_samples,
+        0, DURATION, args.placement_samples
+    )
+    reference_q = [
+        reference_state(t)[0] for t in sample_times
+    ]
+
+    capsule = next(
+        (c for c in KINOVA_CAPSULES
+         if c.name == args.anchor_capsule),
+        None,
     )
 
-    reference_q = [
-        reference_state(t)[0]
-        for t in sample_times
-    ]
-
-    q_start = reference_q[0]
+    if capsule is None:
+        raise ValueError(
+            f"Unknown capsule: {args.anchor_capsule}"
+        )
 
     directions = [
-        unit([1, 0, 0]),
-        unit([-1, 0, 0]),
-        unit([0, 1, 0]),
-        unit([0, -1, 0]),
-        unit([0, 0, 1]),
-        unit([0, 0, -1]),
+        unit(x) for x in (
+            [1, 0, 0], [-1, 0, 0],
+            [0, 1, 0], [0, -1, 0],
+            [0, 0, 1], [0, 0, -1],
+        )
     ]
-
-    capsule = get_capsule(args.anchor_capsule)
 
     obstacles = []
     placement = []
 
     for index, (anchor_t, target) in enumerate(
-        zip(anchor_times, desired_clearances)
+        zip(anchor_times, targets)
     ):
-        q_anchor = reference_state(anchor_t)[0]
-
         anchor = capsule_midpoint(
-            robot, q_anchor, capsule
+            robot,
+            reference_state(anchor_t)[0],
+            capsule,
         )
 
-        best = None
-
-        def evaluate_candidate(shift, direction):
-            center = anchor + shift * direction
-
+        def evaluate(shift, direction):
             sphere = SphereObstacle(
-                center=center,
+                center=anchor + shift * direction,
                 radius=args.obstacle_radius,
                 name=f"obstacle_{index + 1}",
             )
 
-            environment = make_environment(
-                robot, [sphere]
-            )
-
+            env = make_environment(robot, [sphere])
             distances = np.asarray([
-                obstacle_clearances(
-                    environment, q
-                )[0]
+                obstacle_clearances(env, q)[0]
                 for q in reference_q
             ])
 
             closest = int(np.argmin(distances))
 
-            initial = obstacle_clearances(
-                environment, q_start
-            )[0]
-
             return {
                 "sphere": sphere,
-                "min_clearance": float(
-                    distances[closest]
-                ),
-                "closest_time": float(
-                    sample_times[closest]
-                ),
-                "initial_clearance": float(initial),
+                "min_clearance": float(distances[closest]),
+                "closest_time": float(sample_times[closest]),
+                "initial_clearance": float(distances[0]),
             }
 
+        best = None
         shifts = np.linspace(
             0,
             args.max_obstacle_shift,
@@ -334,39 +280,22 @@ def generate_obstacles(robot, args):
             previous = None
 
             for shift in shifts:
-                current = evaluate_candidate(
-                    shift, direction
-                )
+                current = evaluate(shift, direction)
 
                 if previous is not None:
-                    previous_shift, previous_data = previous
-
-                    f0 = (
-                        previous_data["min_clearance"]
-                        - target
-                    )
-                    f1 = (
-                        current["min_clearance"]
-                        - target
-                    )
+                    old_shift, old_data = previous
+                    f0 = old_data["min_clearance"] - target
+                    f1 = current["min_clearance"] - target
 
                     if f0 * f1 <= 0:
-                        lo = previous_shift
-                        hi = shift
+                        lo, hi = old_shift, shift
                         flo = f0
-                        refined = current
+                        candidate = current
 
                         for _ in range(15):
                             mid = 0.5 * (lo + hi)
-
-                            refined = evaluate_candidate(
-                                mid, direction
-                            )
-
-                            fm = (
-                                refined["min_clearance"]
-                                - target
-                            )
+                            candidate = evaluate(mid, direction)
+                            fm = candidate["min_clearance"] - target
 
                             if flo * fm <= 0:
                                 hi = mid
@@ -374,13 +303,10 @@ def generate_obstacles(robot, args):
                                 lo = mid
                                 flo = fm
 
-                        sphere = refined["sphere"]
+                        sphere = candidate["sphere"]
 
-                        if refined[
-                            "initial_clearance"
-                        ] < (
-                            args.safety_distance
-                            + args.initial_buffer
+                        if candidate["initial_clearance"] < (
+                            args.safety_distance + args.initial_buffer
                         ):
                             continue
 
@@ -388,8 +314,7 @@ def generate_obstacles(robot, args):
                             np.linalg.norm(
                                 sphere.center - other.center
                             ) >= (
-                                sphere.radius
-                                + other.radius
+                                sphere.radius + other.radius
                                 + args.min_sphere_gap
                             )
                             for other in obstacles
@@ -399,25 +324,16 @@ def generate_obstacles(robot, args):
                             continue
 
                         score = (
-                            abs(
-                                refined["min_clearance"]
-                                - target
-                            )
+                            abs(candidate["min_clearance"] - target)
                             + args.time_placement_weight
-                            * abs(
-                                refined["closest_time"]
-                                - anchor_t
-                            )
+                            * abs(candidate["closest_time"] - anchor_t)
                         )
 
-                        if (
-                            best is None
-                            or score < best["score"]
-                        ):
+                        if best is None or score < best["score"]:
                             best = {
-                                **refined,
-                                "anchor_time": anchor_t,
+                                **candidate,
                                 "score": score,
+                                "anchor_time": anchor_t,
                             }
 
                 previous = (shift, current)
@@ -430,36 +346,31 @@ def generate_obstacles(robot, args):
         obstacles.append(best["sphere"])
         placement.append(best)
 
-    environment = make_environment(
-        robot, obstacles
-    )
+    environment = make_environment(robot, obstacles)
 
     check_times = np.linspace(
-        0, DURATION,
-        args.reference_check_points,
+        0, DURATION, args.reference_check_points
     )
 
-    reference_distances = reference_clearances(
+    distances = reference_clearances(
         environment, check_times
     )
 
-    minima = reference_distances.min(axis=0)
+    minima = distances.min(axis=0)
 
-    if np.any(
-        minima
-        < args.safety_distance
-        + args.nominal_feasibility_buffer
-    ):
+    if np.any(minima < (
+        args.safety_distance + args.nominal_feasibility_buffer
+    )):
         raise RuntimeError(
-            "Nominal reference violates obstacle "
-            f"feasibility margin: {minima}"
+            "Nominal trajectory not collision-feasible: "
+            f"{minima}"
         )
 
     return (
         obstacles,
         environment,
         placement,
-        (check_times, reference_distances),
+        (check_times, distances),
     )
 
 
@@ -467,14 +378,7 @@ def generate_obstacles(robot, args):
 # MPC construction
 # ============================================================
 
-def create_mpc(
-    robot,
-    environment,
-    args,
-    safe,
-    gn_iters,
-):
-
+def create_mpc(robot, environment, args, safe, gn_iters):
     spline = make_spline(
         args.horizon,
         robot.nv,
@@ -482,22 +386,16 @@ def create_mpc(
     )
 
     tracking_times = np.linspace(
-        0,
-        args.horizon,
-        args.tracking_points,
+        0, args.horizon, args.tracking_points
     )
-
     collision_times = np.linspace(
-        0,
-        args.horizon,
-        args.collision_points,
+        0, args.horizon, args.collision_points
     )
 
     q0, v0, _ = reference_state(0)
 
     initial_c = np.tile(
-        q0,
-        (spline.n_control_points, 1),
+        q0, (spline.n_control_points, 1)
     )
 
     collision = None
@@ -515,8 +413,8 @@ def create_mpc(
         spline=spline,
         tracking_times=tracking_times,
         target_poses=[
-            reference_pose(robot, tau)
-            for tau in tracking_times
+            reference_pose(robot, t)
+            for t in tracking_times
         ],
         q0=q0,
         v0=v0,
@@ -540,17 +438,17 @@ def create_mpc(
         collision_merit_weight=1e4,
     )
 
-    mpc_kwargs = {}
+    options = {}
 
     if safe:
-        mpc_kwargs.update({
+        options = {
             "collision_activation_distance":
                 args.activation_distance,
             "collision_check_samples":
                 args.activation_samples,
             "collision_feasibility_tolerance":
                 args.feasibility_tol,
-        })
+        }
 
     mpc = CartesianMPC(
         problem=problem,
@@ -558,21 +456,49 @@ def create_mpc(
         initial_control_points=initial_c,
         project_warm_start=args.project_warm_start,
         projection_tolerance=args.projection_tol,
-        **mpc_kwargs,
+        **options,
     )
 
-    return (
-        mpc,
-        spline,
-        problem,
-        collision,
-        tracking_times,
-    )
+    return mpc, spline, problem, collision, tracking_times
 
 
 # ============================================================
 # Simulation
 # ============================================================
+
+def empty_record(name, mode, cycle, time_s):
+    return {
+        "experiment": name,
+        "mode": mode,
+        "cycle": cycle,
+        "time_s": time_s,
+        "accepted": False,
+        "executed": False,
+        "status": "",
+        "solver_success": False,
+        "linear_feasible": False,
+        "collision_feasible": "",
+        "compute_ms": np.nan,
+        "gn_iterations": np.nan,
+        "gn_linear_violation": np.nan,
+        "projection_needed": False,
+        "projection_status": "",
+        "projection_ms": 0.0,
+        "warm_violation_before": np.nan,
+        "warm_violation_after": np.nan,
+        "active_count": 0,
+        "active_indices": "",
+        "solve_count": 0,
+        "min_planned_clearance": np.nan,
+        "collision_violation": np.nan,
+        "min_actual_clearance": np.nan,
+        "position_error_mm": np.nan,
+        "orientation_error_deg": np.nan,
+        "joint_error_rad": np.nan,
+        "joint_limit_violation": np.nan,
+        "velocity_limit_violation": np.nan,
+    }
+
 
 def simulate(
     name,
@@ -583,125 +509,65 @@ def simulate(
     mode,
     gn_iters=None,
 ):
-
     q, v, _ = reference_state(0.0)
 
-    mpc = None
-    spline = None
-    problem = None
-    collision = None
-    tracking_times = None
+    mpc = spline = problem = collision = tracking_times = None
 
     if mode != "OPEN":
-        (
-            mpc,
-            spline,
-            problem,
-            collision,
-            tracking_times,
-        ) = create_mpc(
-            robot,
-            environment,
-            args,
-            safe=(mode == "SAFE"),
-            gn_iters=gn_iters,
+        mpc, spline, problem, collision, tracking_times = (
+            create_mpc(
+                robot, environment, args,
+                safe=(mode == "SAFE"),
+                gn_iters=gn_iters,
+            )
         )
 
     e_q = np.zeros(robot.nv)
     e_v = np.zeros(robot.nv)
 
     records = []
-
     q_path = [q.copy()]
-
-    ee_path = [
-        pose_from_theta(
-            robot, q
-        ).translation.copy()
-    ]
+    ee_path = [pose_from_theta(robot, q).translation.copy()]
 
     failure = None
 
-    print("\n" + "=" * 90)
+    print("\n" + "=" * 115)
     print(f"EXPERIMENT: {name}")
-    print("=" * 90)
+    print("=" * 115)
 
     for k in range(args.steps):
         t = k * args.dt
         t_next = (k + 1) * args.dt
-
         disturbance = disturbances[k]
 
-        row = {
-            "experiment": name,
-            "mode": mode,
-            "cycle": k + 1,
-            "time_s": t_next,
-            "compute_ms": np.nan,
-            "gn_iterations": np.nan,
-            "status": "",
-            "active_count": 0,
-            "active_indices": "",
-            "solve_count": 0,
-            "projection_needed": False,
-            "projection_status": "",
-            "projection_ms": 0.0,
-            "warm_violation_before": np.nan,
-            "warm_violation_after": np.nan,
-            "gn_linear_violation": np.nan,
-            "collision_violation": np.nan,
-            "min_planned_clearance": np.nan,
-            "min_actual_clearance": np.nan,
-            "position_error_mm": np.nan,
-            "orientation_error_deg": np.nan,
-            "joint_error_rad": np.nan,
-            "joint_limit_violation": np.nan,
-            "velocity_limit_violation": np.nan,
-            "accepted": False,
-        }
-
+        row = empty_record(name, mode, k + 1, t_next)
         candidate_c = None
 
         try:
             if mode == "OPEN":
-                # Open-loop execution: disturbances
-                # accumulate without feedback.
-                e_q = (
-                    e_q
-                    + e_v * args.dt
+                # Open-loop disturbance accumulation.
+                e_q += (
+                    e_v * args.dt
                     + 0.5 * disturbance * args.dt**2
                 )
+                e_v += disturbance * args.dt
 
-                e_v = (
-                    e_v
-                    + disturbance * args.dt
-                )
-
-                q_ref, v_ref, _ = reference_state(
-                    t_next
-                )
-
+                q_ref, v_ref, _ = reference_state(t_next)
                 q_next = q_ref + e_q
                 v_next = v_ref + e_v
 
                 row["status"] = "open_loop"
+                row["solver_success"] = True
+                row["linear_feasible"] = True
+                row["accepted"] = True
 
             else:
-                # ====================================
-                # Native MPC step
-                #
-                # IMPORTANT:
-                # No external warm-start correction.
-                # No external OSQP projection.
-                # CartesianMPC handles both.
-                # ====================================
-
                 targets = [
                     reference_pose(robot, t + tau)
                     for tau in tracking_times
                 ]
 
-                tic = time.perf_counter()
+                start = time.perf_counter()
 
                 result = mpc.step(
                     q0=q,
@@ -709,89 +575,75 @@ def simulate(
                     target_poses=targets,
                 )
 
-                elapsed_ms = (
-                    1000.0
-                    * (time.perf_counter() - tic)
+                row["compute_ms"] = (
+                    1000 * (time.perf_counter() - start)
                 )
-
-                row["compute_ms"] = elapsed_ms
-                row["gn_iterations"] = result.iterations
+                row["gn_iterations"] = getattr(
+                    result, "iterations", np.nan
+                )
                 row["status"] = str(result.status)
 
-                # ====================================
-                # Native warm-start diagnostics
-                # ====================================
-
-                projection_info = (
-                    mpc.last_projection_info or {}
-                )
+                # Native projection diagnostics.
+                projection = mpc.last_projection_info or {}
 
                 row["projection_needed"] = bool(
-                    projection_info.get(
-                        "projected", False
-                    )
+                    projection.get("projected", False)
                 )
-
-                row["projection_status"] = (
-                    projection_info.get(
-                        "status", ""
-                    )
+                row["projection_status"] = str(
+                    projection.get("status", "")
                 )
-
                 row["projection_ms"] = float(
-                    projection_info.get(
-                        "time_ms", 0.0
-                    )
+                    projection.get("time_ms", 0.0)
                 )
 
-                before = projection_info.get(
-                    "before", None
-                )
+                for source, dest in (
+                    ("before", "warm_violation_before"),
+                    ("after", "warm_violation_after"),
+                ):
+                    value = projection.get(source)
+                    if value is not None:
+                        row[dest] = float(value)
 
-                after = projection_info.get(
-                    "after", None
-                )
-
-                if before is not None:
-                    row["warm_violation_before"] = (
-                        float(before)
-                    )
-
-                if after is not None:
-                    row["warm_violation_after"] = (
-                        float(after)
-                    )
-
-                # ====================================
-                # Obstacle activation diagnostics
-                # ====================================
-
-                collision_info = (
-                    mpc.last_collision_info or {}
-                )
-
-                active_indices = collision_info.get(
+                # Collision activation diagnostics.
+                collision_info = mpc.last_collision_info or {}
+                indices = collision_info.get(
                     "active_indices", ()
                 )
 
-                row["active_count"] = len(
-                    active_indices
-                )
-
+                row["active_count"] = len(indices)
                 row["active_indices"] = ",".join(
-                    str(i) for i in active_indices
+                    map(str, indices)
+                )
+                row["solve_count"] = collision_info.get(
+                    "solve_count", 1
                 )
 
-                row["solve_count"] = (
-                    collision_info.get(
-                        "solve_count", 1
+                # Final MPC acceptance diagnostics.
+                solution_info = mpc.last_solution_info or {}
+
+                row["solver_success"] = bool(
+                    solution_info.get(
+                        "solver_success", result.success
                     )
                 )
 
-                # ====================================
-                # Validate solver output
-                # ====================================
+                row["linear_feasible"] = bool(
+                    solution_info.get("linear_feasible", False)
+                )
 
+                collision_ok = solution_info.get(
+                    "collision_feasible"
+                )
+                row["collision_feasible"] = (
+                    "" if collision_ok is None
+                    else bool(collision_ok)
+                )
+
+                row["accepted"] = bool(
+                    solution_info.get("accepted", False)
+                )
+
+                # Independent measurement for reporting.
                 candidate_c = np.asarray(
                     result.control_points,
                     dtype=float,
@@ -800,325 +652,194 @@ def simulate(
                     robot.nv,
                 )
 
-                if not np.all(
-                    np.isfinite(candidate_c)
-                ):
+                if not np.all(np.isfinite(candidate_c)):
                     raise RuntimeError(
-                        "Non-finite GN control points"
+                        "GN returned non-finite coefficients"
                     )
-
-                gn_violation = linear_violation(
-                    problem,
-                    candidate_c,
-                )
 
                 row["gn_linear_violation"] = (
-                    gn_violation
+                    linear_violation(problem, candidate_c)
                 )
-
-                # ====================================
-                # Print projection diagnostics
-                # ====================================
-
-                if (
-                    args.debug_all
-                    or (
-                        args.debug_projection
-                        and row["projection_needed"]
-                    )
-                ):
-                    print(
-                        f"\n[PROJECTION {name} "
-                        f"cycle {k+1}]"
-                    )
-
-                    print(
-                        "  violation before: "
-                        f"{row['warm_violation_before']:.3e}"
-                    )
-
-                    print(
-                        "  violation after : "
-                        f"{row['warm_violation_after']:.3e}"
-                    )
-
-                    print(
-                        "  projection time : "
-                        f"{row['projection_ms']:.3f} ms"
-                    )
-
-                    print(
-                        "  projection status: "
-                        f"{row['projection_status']}"
-                    )
-
-                    print(
-                        "  GN violation    : "
-                        f"{gn_violation:.3e}"
-                    )
-
-                if gn_violation > args.feasibility_tol:
-                    print(
-                        f"\nLINEAR FAILURE | "
-                        f"{name} | cycle={k+1}"
-                    )
-
-                    print(
-                        "  Warm start before:",
-                        row["warm_violation_before"]
-                    )
-
-                    print(
-                        "  Warm start after:",
-                        row["warm_violation_after"]
-                    )
-
-                    print(
-                        "  GN violation:",
-                        gn_violation
-                    )
-
-                    print(
-                        "  Current velocity:",
-                        np.round(v, 5)
-                    )
-
-                    print(
-                        "  Reference velocity:",
-                        np.round(
-                            reference_state(t)[1],
-                            5,
-                        )
-                    )
-
-                    print_linear_failure(
-                        problem,
-                        candidate_c,
-                    )
-
-                    raise RuntimeError(
-                        "GN linear violation: "
-                        f"{gn_violation:.6e}"
-                    )
-
-                # ====================================
-                # Validate planned collisions
-                # ====================================
 
                 if mode == "SAFE":
-                    min_planned = (
-                        collision.minimum_distance(
-                            candidate_c
-                        )
+                    min_planned = float(
+                        collision.minimum_distance(candidate_c)
                     )
-
-                    collision_violation = max(
+                    row["min_planned_clearance"] = min_planned
+                    row["collision_violation"] = max(
                         0.0,
-                        args.safety_distance
-                        - min_planned,
+                        args.safety_distance - min_planned,
                     )
 
-                    row["min_planned_clearance"] = (
-                        min_planned
+                if args.debug_all or (
+                    args.debug_projection
+                    and row["projection_needed"]
+                ):
+                    print(
+                        f"\n[DIAGNOSTICS {name} cycle {k+1}]"
+                    )
+                    print(
+                        "  Warm violation before:",
+                        row["warm_violation_before"]
+                    )
+                    print(
+                        "  Warm violation after :",
+                        row["warm_violation_after"]
+                    )
+                    print(
+                        "  Projection status    :",
+                        row["projection_status"]
+                    )
+                    print(
+                        "  Projection time      :",
+                        f"{row['projection_ms']:.3f} ms"
+                    )
+                    print(
+                        "  GN linear violation  :",
+                        f"{row['gn_linear_violation']:.3e}"
+                    )
+                    print(
+                        "  Solver success       :",
+                        row["solver_success"]
+                    )
+                    print(
+                        "  Linear feasible      :",
+                        row["linear_feasible"]
+                    )
+                    print(
+                        "  Collision feasible   :",
+                        row["collision_feasible"]
+                    )
+                    print(
+                        "  Accepted             :",
+                        row["accepted"]
                     )
 
-                    row["collision_violation"] = (
-                        collision_violation
+                # Important: do not execute rejected results.
+                if not row["accepted"]:
+                    print("\nMPC SOLUTION REJECTED")
+                    print("  Experiment:", name)
+                    print("  Cycle:", k + 1)
+                    print("  Solver status:", result.status)
+                    print("  Solver success:", row["solver_success"])
+                    print("  Linear feasible:", row["linear_feasible"])
+                    print("  Collision feasible:", row["collision_feasible"])
+                    print(
+                        "  GN linear violation:",
+                        row["gn_linear_violation"]
                     )
 
-                    if (
-                        collision_violation
-                        > args.feasibility_tol
+                    if np.isfinite(
+                        row["gn_linear_violation"]
                     ):
-                        raise RuntimeError(
-                            "Planned collision violation: "
-                            f"{collision_violation:.6e}"
+                        print_linear_failure(
+                            problem, candidate_c
                         )
 
-                # ====================================
-                # GN status
-                #
-                # Keep the existing conservative
-                # behavior for now.
-                # Status policy will be handled in
-                # the next project step.
-                # ====================================
-
-                if (
-                    not result.success
-                    and str(result.status)
-                    not in ("max_iterations",)
-                ):
                     raise RuntimeError(
-                        f"GN status: {result.status}"
+                        "MPC rejected final GN solution"
                     )
 
-                # ====================================
-                # Execute first MPC interval
-                # ====================================
-
+                # Execute only the first MPC interval.
                 q_command = spline.position(
-                    candidate_c,
-                    args.dt,
+                    candidate_c, args.dt
                 )
-
                 v_command = spline.velocity(
-                    candidate_c,
-                    args.dt,
+                    candidate_c, args.dt
                 )
 
                 q_next = (
                     q_command
                     + 0.5 * disturbance * args.dt**2
                 )
-
                 v_next = (
-                    v_command
-                    + disturbance * args.dt
+                    v_command + disturbance * args.dt
                 )
 
-                # Do not overwrite:
-                # mpc.previous_control_points
-                #
-                # Warm-start ownership now belongs
-                # exclusively to CartesianMPC.
-
-            # ========================================
-            # Executed state diagnostics
-            # ========================================
-
+            # Executed-state diagnostics.
             actual_distances = obstacle_clearances(
                 environment, q_next
             )
-
-            min_actual = float(
-                actual_distances.min()
-            )
+            min_actual = float(actual_distances.min())
 
             q_violation = bound_violation(
-                q_next,
-                Q_MIN,
-                Q_MAX,
+                q_next, Q_MIN, Q_MAX
             )
-
             v_violation = bound_violation(
-                v_next,
-                V_MIN,
-                V_MAX,
+                v_next, V_MIN, V_MAX
             )
 
-            row["min_actual_clearance"] = (
-                min_actual
-            )
+            row["min_actual_clearance"] = min_actual
+            row["joint_limit_violation"] = q_violation
+            row["velocity_limit_violation"] = v_violation
 
-            row["joint_limit_violation"] = (
-                q_violation
-            )
-
-            row["velocity_limit_violation"] = (
-                v_violation
-            )
-
-            if max(
-                q_violation,
-                v_violation,
-            ) > args.feasibility_tol:
+            if max(q_violation, v_violation) > args.feasibility_tol:
                 raise RuntimeError(
-                    "Executed joint/velocity "
-                    "limit violation"
+                    "Executed joint or velocity limit violation"
                 )
 
-            # Accept executed state.
-            q = np.asarray(
-                q_next, dtype=float
-            ).copy()
+            q = np.asarray(q_next, dtype=float).copy()
+            v = np.asarray(v_next, dtype=float).copy()
 
-            v = np.asarray(
-                v_next, dtype=float
-            ).copy()
+            actual_pose = pose_from_theta(robot, q)
+            desired_pose = reference_pose(robot, t_next)
+            ep, eo = pose_errors(actual_pose, desired_pose)
 
-            actual_pose = pose_from_theta(
-                robot, q
+            row["position_error_mm"] = 1000.0 * ep
+            row["orientation_error_deg"] = np.degrees(eo)
+            row["joint_error_rad"] = np.linalg.norm(
+                q - reference_state(t_next)[0]
             )
 
-            desired_pose = reference_pose(
-                robot, t_next
-            )
-
-            ep, eo = pose_errors(
-                actual_pose,
-                desired_pose,
-            )
-
-            q_ref = reference_state(
-                t_next
-            )[0]
-
-            row["position_error_mm"] = (
-                1000.0 * ep
-            )
-
-            row["orientation_error_deg"] = (
-                np.degrees(eo)
-            )
-
-            row["joint_error_rad"] = (
-                np.linalg.norm(q - q_ref)
-            )
-
-            row["accepted"] = True
+            row["executed"] = True
 
             q_path.append(q.copy())
-
-            ee_path.append(
-                actual_pose.translation.copy()
-            )
-
+            ee_path.append(actual_pose.translation.copy())
             records.append(row)
 
             safety = (
-                "OK"
+                "SAFE"
                 if min_actual >= args.safety_distance
-                else "VIOLATION"
+                else "CLEARANCE VIOLATION"
             )
 
-            compute = row["compute_ms"]
+            compute_text = (
+                "    --"
+                if mode == "OPEN"
+                else f"{row['compute_ms']:7.2f}"
+            )
 
-            if mode == "OPEN":
-                compute_text = "    nan"
-            else:
-                compute_text = f"{compute:7.1f}"
+            gn_text = (
+                "--"
+                if mode == "OPEN"
+                else f"{row['gn_linear_violation']:.1e}"
+            )
 
             print(
-                f"[{name:12s} {k+1:03d}] "
+                f"[{name:10s} {k+1:03d}/{args.steps:03d}] "
                 f"{compute_text} ms | "
                 f"pos={row['position_error_mm']:7.3f} mm | "
                 f"ori={row['orientation_error_deg']:6.3f} deg | "
-                f"clear={min_actual:.4f} m | "
-                f"obs={row['active_count']}/{args.n_obstacles} | "
+                f"clear={min_actual:7.4f} m | "
+                f"active={row['active_count']}/{args.n_obstacles} | "
                 f"proj={int(row['projection_needed'])} | "
-                f"GN={row['gn_linear_violation']:.1e} | "
+                f"GN={gn_text} | "
+                f"accepted={int(row['accepted'])} | "
                 f"{safety}"
             )
 
         except Exception as exc:
-            row["status"] = str(exc)
+            row["status"] = (
+                f"{row['status']} | ERROR: {exc}"
+            )
             records.append(row)
 
             failure = f"Cycle {k+1}: {exc}"
 
-            print(
-                f"\n[{name}] FAILED: {failure}"
-            )
-
-            if (
-                problem is not None
-                and candidate_c is not None
-            ):
-                print_linear_failure(
-                    problem,
-                    candidate_c,
-                )
+            print("\n" + "!" * 85)
+            print(f"FAILED: {name}")
+            print(failure)
+            print("!" * 85)
 
             break
 
@@ -1140,82 +861,79 @@ def simulate(
 
 def summarize(run, args):
     rows = [
-        row for row in run["records"]
-        if row["accepted"]
+        r for r in run["records"] if r["executed"]
+    ]
+    attempted = [
+        r for r in run["records"] if r["mode"] != "OPEN"
     ]
 
-    def values(key):
-        x = np.asarray([
-            row[key] for row in rows
-        ], dtype=float)
-
-        return x[np.isfinite(x)]
-
-    times = values("compute_ms")
-    clearances = values("min_actual_clearance")
-
-    projection_times = values(
-        "projection_ms"
+    times = finite_values(rows, "compute_ms")
+    clearances = finite_values(rows, "min_actual_clearance")
+    projection_times = finite_values(
+        attempted, "projection_ms"
     )
 
-    gn_violations = values(
-        "gn_linear_violation"
-    )
+    def mean(x):
+        return float(x.mean()) if x.size else np.nan
 
-    warm_violations = values(
-        "warm_violation_before"
-    )
+    def percentile(x, p):
+        return (
+            float(np.percentile(x, p))
+            if x.size else np.nan
+        )
 
     return {
         "experiment": run["name"],
         "complete": run["complete"],
         "cycles": len(rows),
-        "mean_ms": (
-            float(times.mean())
-            if times.size else np.nan
+        "attempted_cycles": len(run["records"]),
+        "accepted_solutions": sum(
+            bool(r["accepted"]) for r in attempted
         ),
-        "median_ms": (
-            float(np.median(times))
-            if times.size else np.nan
+        "rejected_solutions": sum(
+            not bool(r["accepted"]) for r in attempted
         ),
-        "p95_ms": (
-            float(np.percentile(times, 95))
-            if times.size else np.nan
+        "mean_ms": mean(times),
+        "median_ms": percentile(times, 50),
+        "p95_ms": percentile(times, 95),
+        "max_ms": (
+            float(times.max()) if times.size else np.nan
         ),
         "position_rms_mm": rms(
-            values("position_error_mm")
+            finite_values(rows, "position_error_mm")
         ),
         "orientation_rms_deg": rms(
-            values("orientation_error_deg")
+            finite_values(rows, "orientation_error_deg")
+        ),
+        "joint_rms_rad": rms(
+            finite_values(rows, "joint_error_rad")
         ),
         "min_clearance_m": (
             float(clearances.min())
             if clearances.size else np.nan
         ),
-        "collision_violation_cycles": int(
-            np.sum(
-                clearances < args.safety_distance
-            )
+        "clearance_violation_cycles": sum(
+            r["min_actual_clearance"] < args.safety_distance
+            for r in rows
         ),
         "active_cycles": sum(
-            row["active_count"] > 0
-            for row in rows
+            r["active_count"] > 0 for r in attempted
         ),
         "projection_cycles": sum(
-            row["projection_needed"]
-            for row in rows
+            bool(r["projection_needed"]) for r in attempted
         ),
-        "projection_mean_ms": (
-            float(projection_times.mean())
-            if projection_times.size else np.nan
-        ),
+        "projection_mean_ms": mean(projection_times),
         "max_warm_violation": (
-            float(warm_violations.max())
-            if warm_violations.size else np.nan
+            float(x.max())
+            if (x := finite_values(
+                attempted, "warm_violation_before"
+            )).size else np.nan
         ),
         "max_gn_violation": (
-            float(gn_violations.max())
-            if gn_violations.size else np.nan
+            float(x.max())
+            if (x := finite_values(
+                attempted, "gn_linear_violation"
+            )).size else np.nan
         ),
         "failure": run["failure"] or "",
     }
@@ -1223,54 +941,45 @@ def summarize(run, args):
 
 def export_csv(runs, summaries, output):
     rows = [
-        row
-        for run in runs
-        for row in run["records"]
+        r for run in runs for r in run["records"]
     ]
 
     if rows:
-        with (
-            output / "cycles.csv"
-        ).open(
-            "w",
-            newline="",
-            encoding="utf-8",
+        with (output / "cycles.csv").open(
+            "w", newline="", encoding="utf-8"
         ) as f:
             writer = csv.DictWriter(
-                f,
-                fieldnames=list(rows[0].keys()),
+                f, fieldnames=list(rows[0].keys())
             )
-
             writer.writeheader()
             writer.writerows(rows)
 
-    with (
-        output / "summary.csv"
-    ).open(
-        "w",
-        newline="",
-        encoding="utf-8",
+    with (output / "summary.csv").open(
+        "w", newline="", encoding="utf-8"
     ) as f:
         writer = csv.DictWriter(
-            f,
-            fieldnames=list(summaries[0].keys()),
+            f, fieldnames=list(summaries[0].keys())
         )
-
         writer.writeheader()
         writer.writerows(summaries)
 
 
 # ============================================================
-# Plotting
+# Plot helpers
 # ============================================================
 
+def save_plot(fig, output, name):
+    fig.tight_layout()
+    fig.savefig(
+        output / name,
+        dpi=180,
+        bbox_inches="tight",
+    )
+
+
 def draw_sphere(ax, center, radius, color, alpha):
-    u = np.linspace(
-        0, 2 * np.pi, 24
-    )
-    v = np.linspace(
-        0, np.pi, 14
-    )
+    u = np.linspace(0, 2 * np.pi, 24)
+    v = np.linspace(0, np.pi, 14)
 
     x = center[0] + radius * np.outer(
         np.cos(u), np.sin(v)
@@ -1292,301 +1001,250 @@ def draw_sphere(ax, center, radius, color, alpha):
 
 def equal_axes_3d(ax, arrays):
     points = np.vstack(arrays)
-
     center = 0.5 * (
-        points.min(axis=0)
-        + points.max(axis=0)
+        points.min(axis=0) + points.max(axis=0)
     )
-
     radius = max(
         0.5 * np.max(
-            points.max(axis=0)
-            - points.min(axis=0)
+            points.max(axis=0) - points.min(axis=0)
         ),
         0.05,
     ) * 1.1
 
-    ax.set_xlim(
-        center[0] - radius,
-        center[0] + radius,
-    )
-    ax.set_ylim(
-        center[1] - radius,
-        center[1] + radius,
-    )
-    ax.set_zlim(
-        center[2] - radius,
-        center[2] + radius,
-    )
+    ax.set_xlim(center[0] - radius, center[0] + radius)
+    ax.set_ylim(center[1] - radius, center[1] + radius)
+    ax.set_zlim(center[2] - radius, center[2] + radius)
     ax.set_box_aspect((1, 1, 1))
 
 
-def plot_results(
-    robot,
-    obstacles,
-    runs,
-    args,
-    nominal_data,
-):
-    ref_times, ref_clearances = nominal_data
+# ============================================================
+# Plotting
+# ============================================================
 
+def plot_results(robot, obstacles, runs, args, nominal_data):
     colors = {
         run["name"]: f"C{i % 10}"
         for i, run in enumerate(runs)
     }
 
-    def accepted(run):
+    def executed(run):
         return [
-            row for row in run["records"]
-            if row["accepted"]
+            r for r in run["records"] if r["executed"]
+        ]
+
+    def attempted(run):
+        return [
+            r for r in run["records"]
+            if run["mode"] != "OPEN"
         ]
 
     # --------------------------------------------------------
-    # 1. Cartesian tracking
+    # 1. Tracking errors
     # --------------------------------------------------------
-
     fig, axes = plt.subplots(
-        2, 1,
-        figsize=(12, 8),
-        sharex=True,
+        2, 1, figsize=(12, 8), sharex=True
     )
 
     for run in runs:
-        rows = accepted(run)
-
-        if not rows:
-            continue
-
-        t = [
-            row["time_s"] for row in rows
-        ]
+        rows = executed(run)
+        t = [r["time_s"] for r in rows]
 
         axes[0].plot(
             t,
-            [
-                row["position_error_mm"]
-                for row in rows
-            ],
-            color=colors[run["name"]],
+            [r["position_error_mm"] for r in rows],
             label=run["name"],
+            color=colors[run["name"]],
         )
-
         axes[1].plot(
             t,
-            [
-                row["orientation_error_deg"]
-                for row in rows
-            ],
-            color=colors[run["name"]],
+            [r["orientation_error_deg"] for r in rows],
             label=run["name"],
+            color=colors[run["name"]],
         )
 
     axes[0].set_ylabel("Position error [mm]")
     axes[1].set_ylabel("Orientation error [deg]")
     axes[1].set_xlabel("Time [s]")
+    axes[0].set_title("Cartesian tracking errors")
 
     for ax in axes:
-        ax.grid(alpha=0.3)
+        ax.grid(True)
         ax.legend()
 
-    fig.suptitle(
-        "Cartesian tracking under disturbances"
-    )
-    fig.tight_layout()
-    fig.savefig(
-        args.output / "tracking_errors.png",
-        dpi=180,
-    )
+    save_plot(fig, args.output, "tracking_errors.png")
 
     # --------------------------------------------------------
-    # 2. Obstacle clearances
+    # 2. Joint tracking
     # --------------------------------------------------------
-
     fig, axes = plt.subplots(
-        args.n_obstacles,
-        1,
-        figsize=(12, 3.3 * args.n_obstacles),
-        sharex=True,
-        squeeze=False,
+        7, 1, figsize=(14, 16), sharex=True
     )
 
-    for j, obstacle in enumerate(obstacles):
-        ax = axes[j, 0]
+    reference_times = np.arange(args.steps + 1) * args.dt
+    q_ref = np.asarray([
+        reference_state(t)[0]
+        for t in reference_times
+    ])
 
+    for j, ax in enumerate(axes):
         ax.plot(
-            ref_times,
-            ref_clearances[:, j],
+            reference_times,
+            q_ref[:, j],
             "k--",
-            label="Nominal",
+            linewidth=1.6,
+            label="Reference",
         )
-
-        env_j = make_environment(
-            robot, [obstacle]
+        ax.axhline(
+            Q_MIN[j], color="red",
+            linestyle=":", alpha=0.6
+        )
+        ax.axhline(
+            Q_MAX[j], color="red",
+            linestyle=":", alpha=0.6
         )
 
         for run in runs:
             path = run["q_path"]
             t = np.arange(len(path)) * args.dt
 
-            clearances = [
-                obstacle_clearances(
-                    env_j, q
-                )[0]
-                for q in path
-            ]
-
             ax.plot(
-                t,
-                clearances,
+                t, path[:, j],
                 color=colors[run["name"]],
                 label=run["name"],
+                linewidth=1.2,
+            )
+
+        ax.set_ylabel(f"q{j+1} [rad]")
+        ax.grid(True)
+
+    axes[0].legend(ncol=3)
+    axes[-1].set_xlabel("Time [s]")
+    axes[0].set_title("Joint-space tracking and position limits")
+
+    save_plot(fig, args.output, "joint_tracking.png")
+
+    # --------------------------------------------------------
+    # 3. Obstacle clearances
+    # --------------------------------------------------------
+    fig, axes = plt.subplots(
+        args.n_obstacles,
+        1,
+        figsize=(13, 3.4 * args.n_obstacles),
+        sharex=True,
+        squeeze=False,
+    )
+
+    nominal_times, nominal_clearances = nominal_data
+
+    for j in range(args.n_obstacles):
+        ax = axes[j, 0]
+
+        ax.plot(
+            nominal_times,
+            nominal_clearances[:, j],
+            "k--",
+            linewidth=1.8,
+            label="Nominal reference",
+        )
+
+        for run in runs:
+            path = run["q_path"]
+            env = make_environment(robot, [obstacles[j]])
+
+            distances = np.asarray([
+                obstacle_clearances(env, q)[0]
+                for q in path
+            ])
+
+            t = np.arange(len(path)) * args.dt
+
+            ax.plot(
+                t, distances,
+                label=run["name"],
+                color=colors[run["name"]],
             )
 
         ax.axhline(
             args.safety_distance,
             color="red",
-            linestyle="--",
-            label="Safety margin",
-        )
-
-        ax.axhline(
-            0.0,
-            color="gray",
             linestyle=":",
+            linewidth=1.5,
+            label="Safety threshold",
+        )
+        ax.axhline(
+            0.0, color="black",
+            linewidth=0.8
         )
 
-        ax.set_ylabel("Clearance [m]")
-        ax.set_title(obstacle.name)
-        ax.grid(alpha=0.3)
-        ax.legend(fontsize=8)
+        ax.set_ylabel(f"Obstacle {j+1} [m]")
+        ax.grid(True)
+        ax.legend(ncol=3, fontsize=8)
 
     axes[-1, 0].set_xlabel("Time [s]")
+    fig.suptitle("Robot-obstacle clearances", y=1.01)
 
-    fig.suptitle("Robot-obstacle clearances")
-    fig.tight_layout()
-    fig.savefig(
-        args.output / "obstacle_clearances.png",
-        dpi=180,
-    )
+    save_plot(fig, args.output, "obstacle_clearances.png")
 
     # --------------------------------------------------------
-    # 3. MPC timings
+    # 4. MPC timing and iterations
     # --------------------------------------------------------
-
     fig, axes = plt.subplots(
-        2, 1,
-        figsize=(12, 8),
-        sharex=True,
+        2, 1, figsize=(13, 9), sharex=True
     )
 
     for run in runs:
         if run["mode"] == "OPEN":
             continue
 
-        rows = accepted(run)
+        rows = attempted(run)
         t = [r["time_s"] for r in rows]
+        color = colors[run["name"]]
 
         axes[0].plot(
             t,
             [r["compute_ms"] for r in rows],
-            color=colors[run["name"]],
+            color=color,
             label=run["name"],
         )
-
         axes[1].plot(
             t,
             [r["gn_iterations"] for r in rows],
-            color=colors[run["name"]],
+            color=color,
             label=run["name"],
         )
 
     axes[0].axhline(
         args.dt * 1000,
-        color="black",
         linestyle="--",
-        label="Control period",
+        color="black",
+        label="MPC time budget",
     )
-
-    axes[0].set_ylabel("Total MPC time [ms]")
+    axes[0].set_ylabel("Compute time [ms]")
     axes[1].set_ylabel("GN iterations")
     axes[1].set_xlabel("Time [s]")
+    axes[0].set_title("MPC computational performance")
 
     for ax in axes:
-        ax.grid(alpha=0.3)
+        ax.grid(True)
         ax.legend()
 
-    fig.suptitle("MPC computation")
-    fig.tight_layout()
-    fig.savefig(
-        args.output / "mpc_timing.png",
-        dpi=180,
-    )
+    save_plot(fig, args.output, "mpc_timing.png")
 
     # --------------------------------------------------------
-    # 4. Obstacle activation
+    # 5. Warm-start feasibility and GN
     # --------------------------------------------------------
-
     fig, axes = plt.subplots(
-        2, 1,
-        figsize=(12, 7),
-        sharex=True,
+        3, 1, figsize=(13, 11), sharex=True
     )
 
-    for run in runs:
-        if run["mode"] != "SAFE":
-            continue
-
-        rows = accepted(run)
-        t = [r["time_s"] for r in rows]
-
-        axes[0].step(
-            t,
-            [r["active_count"] for r in rows],
-            where="post",
-            label=run["name"],
-        )
-
-        axes[1].step(
-            t,
-            [r["solve_count"] for r in rows],
-            where="post",
-            label=run["name"],
-        )
-
-    axes[0].set_ylabel("Active obstacles")
-    axes[1].set_ylabel("Solves per cycle")
-    axes[1].set_xlabel("Time [s]")
-
-    for ax in axes:
-        ax.grid(alpha=0.3)
-        ax.legend()
-
-    fig.suptitle("Obstacle activation")
-    fig.tight_layout()
-    fig.savefig(
-        args.output / "obstacle_activation.png",
-        dpi=180,
-    )
-
-    # --------------------------------------------------------
-    # 5. Native projection diagnostics
-    # --------------------------------------------------------
-
-    fig, axes = plt.subplots(
-        3, 1,
-        figsize=(12, 10),
-        sharex=True,
-    )
-
-    fields = [
+    keys = [
         "warm_violation_before",
         "warm_violation_after",
         "gn_linear_violation",
     ]
-
-    labels = [
-        "Before projection",
-        "After projection",
+    titles = [
+        "Before OSQP projection",
+        "After OSQP projection",
         "After Gauss-Newton",
     ]
 
@@ -1594,152 +1252,196 @@ def plot_results(
         if run["mode"] == "OPEN":
             continue
 
-        rows = accepted(run)
-        t = [r["time_s"] for r in rows]
+        rows = attempted(run)
+        t = np.asarray([r["time_s"] for r in rows])
 
-        for ax, field in zip(axes, fields):
-            values = np.array([
-                r[field] for r in rows
-            ], dtype=float)
-
-            values = np.where(
-                np.isfinite(values),
-                np.maximum(values, 1e-12),
-                np.nan,
+        for ax, key in zip(axes, keys):
+            values = np.asarray(
+                [r[key] for r in rows],
+                dtype=float,
             )
+            valid = np.isfinite(values)
 
             ax.semilogy(
-                t,
-                values,
+                t[valid],
+                np.maximum(values[valid], 1e-12),
                 color=colors[run["name"]],
                 label=run["name"],
             )
 
-    for ax, label in zip(axes, labels):
-        ax.axhline(
-            args.feasibility_tol,
-            color="red",
-            linestyle="--",
-            linewidth=1,
-            label="Tolerance",
-        )
-        ax.set_ylabel(label)
-        ax.grid(alpha=0.3)
-        ax.legend(fontsize=8)
+    for ax, title in zip(axes, titles):
+        ax.set_title(title)
+        ax.set_ylabel("Max violation")
+        ax.grid(True, which="both")
+        ax.legend()
+
+    axes[1].axhline(
+        args.projection_tol,
+        color="red",
+        linestyle=":",
+        label="Projection tolerance",
+    )
+    axes[2].axhline(
+        args.projection_tol,
+        color="red",
+        linestyle=":",
+        label="MPC acceptance tolerance",
+    )
 
     axes[-1].set_xlabel("Time [s]")
-
-    fig.suptitle(
-        "Native MPC warm-start feasibility"
-    )
-    fig.tight_layout()
-    fig.savefig(
-        args.output / "warm_start_feasibility.png",
-        dpi=180,
+    save_plot(
+        fig, args.output,
+        "warm_start_feasibility.png",
     )
 
     # --------------------------------------------------------
-    # 6. 3D Cartesian trajectories
+    # 6. Obstacle activation
     # --------------------------------------------------------
-
-    fig = plt.figure(figsize=(13, 10))
-    ax = fig.add_subplot(
-        111,
-        projection="3d",
+    fig, axes = plt.subplots(
+        2, 1, figsize=(13, 8), sharex=True
     )
 
-    ref_t = np.linspace(
-        0, DURATION, 301
+    for run in runs:
+        if run["mode"] != "SAFE":
+            continue
+
+        rows = attempted(run)
+        t = [r["time_s"] for r in rows]
+        color = colors[run["name"]]
+
+        axes[0].step(
+            t,
+            [r["active_count"] for r in rows],
+            where="post",
+            label=run["name"],
+            color=color,
+        )
+        axes[1].step(
+            t,
+            [r["solve_count"] for r in rows],
+            where="post",
+            label=run["name"],
+            color=color,
+        )
+
+    axes[0].set_ylabel("Active obstacles")
+    axes[1].set_ylabel("GN solves / cycle")
+    axes[1].set_xlabel("Time [s]")
+    axes[0].set_ylim(-0.2, args.n_obstacles + 0.5)
+
+    for ax in axes:
+        ax.grid(True)
+        ax.legend()
+
+    save_plot(
+        fig, args.output,
+        "obstacle_activation.png",
     )
 
-    ref_ee = np.asarray([
-        reference_pose(
-            robot, t
-        ).translation.copy()
-        for t in ref_t
+    # --------------------------------------------------------
+    # 7. Cartesian 3D trajectories
+    # --------------------------------------------------------
+    fig = plt.figure(figsize=(12, 10))
+    ax = fig.add_subplot(111, projection="3d")
+
+    reference_positions = np.asarray([
+        pose_from_theta(
+            robot, reference_state(t)[0]
+        ).translation
+        for t in reference_times
     ])
 
     ax.plot(
-        ref_ee[:, 0],
-        ref_ee[:, 1],
-        ref_ee[:, 2],
+        reference_positions[:, 0],
+        reference_positions[:, 1],
+        reference_positions[:, 2],
         "k--",
-        linewidth=2,
-        label="Nominal EE",
+        linewidth=2.5,
+        label="Reference",
     )
 
-    all_points = [ref_ee]
+    paths = [reference_positions]
 
     for run in runs:
         path = run["ee_path"]
+        paths.append(path)
 
         ax.plot(
             path[:, 0],
             path[:, 1],
             path[:, 2],
             color=colors[run["name"]],
-            linewidth=2,
             label=run["name"],
         )
 
-        all_points.append(path)
-
-    for j, sphere in enumerate(obstacles):
-        color = f"C{j + 5}"
-
+    for j, obstacle in enumerate(obstacles):
         draw_sphere(
             ax,
-            sphere.center,
-            sphere.radius,
-            color,
-            0.35,
+            obstacle.center,
+            obstacle.radius,
+            color="red",
+            alpha=0.25,
         )
-
-        draw_sphere(
-            ax,
-            sphere.center,
-            sphere.radius + args.safety_distance,
-            color,
-            0.055,
+        ax.scatter(
+            *obstacle.center,
+            marker="x",
+            color="red",
+            s=50,
         )
-
         ax.text(
-            *sphere.center,
-            f"O{j + 1}",
+            *obstacle.center,
+            f"O{j+1}",
         )
 
-        radius = (
-            sphere.radius
-            + args.safety_distance
-        )
-
-        all_points.append(
-            np.array([
-                sphere.center - radius,
-                sphere.center + radius,
-            ])
-        )
-
-    equal_axes_3d(ax, all_points)
+    equal_axes_3d(ax, paths)
 
     ax.set_xlabel("X [m]")
     ax.set_ylabel("Y [m]")
     ax.set_zlabel("Z [m]")
-    ax.set_title(
-        "Kinova Gen3 — cluttered tracking"
+    ax.set_title("Cartesian trajectories - Kinova Gen3")
+    ax.legend()
+
+    save_plot(fig, args.output, "trajectories_3d.png")
+
+    # --------------------------------------------------------
+    # 8. Additional Phase 1 diagnostics
+    # --------------------------------------------------------
+    fig, axes = plt.subplots(
+        2, 1, figsize=(13, 8), sharex=True
     )
 
-    ax.view_init(
-        elev=23,
-        azim=-55,
-    )
+    for run in runs:
+        if run["mode"] == "OPEN":
+            continue
 
-    ax.legend(fontsize=8)
-    fig.tight_layout()
-    fig.savefig(
-        args.output / "trajectories_3d.png",
-        dpi=180,
-    )
+        rows = attempted(run)
+        t = [r["time_s"] for r in rows]
+
+        axes[0].step(
+            t,
+            [int(r["accepted"]) for r in rows],
+            where="post",
+            label=run["name"],
+            color=colors[run["name"]],
+        )
+        axes[1].plot(
+            t,
+            [r["projection_ms"] for r in rows],
+            label=run["name"],
+            color=colors[run["name"]],
+        )
+
+    axes[0].set_ylabel("MPC accepted [0/1]")
+    axes[0].set_ylim(-0.15, 1.15)
+    axes[1].set_ylabel("Projection time [ms]")
+    axes[1].set_xlabel("Time [s]")
+    axes[0].set_title("Phase 1 - MPC validation diagnostics")
+
+    for ax in axes:
+        ax.grid(True)
+        ax.legend()
+
+    save_plot(fig, args.output, "mpc_diagnostics.png")
 
     if args.show_plots:
         plt.show()
@@ -1754,199 +1456,104 @@ def plot_results(
 def main():
     parser = argparse.ArgumentParser()
 
+    parser.add_argument("--dt", type=float, default=0.1)
+    parser.add_argument("--horizon", type=float, default=1.5)
+    parser.add_argument("--steps", type=int, default=100)
     parser.add_argument(
-        "--dt",
-        type=float,
-        default=0.1,
+        "--gn-iters", nargs="+", type=int, default=[2, 5]
+    )
+    parser.add_argument(
+        "--noise-std", type=float, default=0.35
+    )
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--control-points", type=int, default=12
+    )
+    parser.add_argument(
+        "--tracking-points", type=int, default=15
+    )
+    parser.add_argument(
+        "--collision-points", type=int, default=20
+    )
+    parser.add_argument(
+        "--orientation-scale", type=float, default=0.1
+    )
+    parser.add_argument(
+        "--lambda-terminal", type=float, default=1.0
     )
 
     parser.add_argument(
-        "--horizon",
-        type=float,
-        default=1.5,
+        "--activation-distance", type=float, default=0.25
     )
-
     parser.add_argument(
-        "--steps",
-        type=int,
-        default=100,
+        "--activation-samples", type=int, default=11
     )
-
     parser.add_argument(
-        "--gn-iters",
-        nargs="+",
-        type=int,
-        default=[2, 5],
+        "--feasibility-tol", type=float, default=1e-4
     )
-
     parser.add_argument(
-        "--noise-std",
-        type=float,
-        default=0.35,
+        "--projection-tol", type=float, default=1e-8
     )
-
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-    )
-
-    parser.add_argument(
-        "--control-points",
-        type=int,
-        default=12,
-    )
-
-    parser.add_argument(
-        "--tracking-points",
-        type=int,
-        default=15,
-    )
-
-    parser.add_argument(
-        "--collision-points",
-        type=int,
-        default=20,
-    )
-
-    parser.add_argument(
-        "--orientation-scale",
-        type=float,
-        default=0.1,
-    )
-
-    parser.add_argument(
-        "--lambda-terminal",
-        type=float,
-        default=1.0,
-    )
-
-    parser.add_argument(
-        "--activation-distance",
-        type=float,
-        default=0.25,
-    )
-
-    parser.add_argument(
-        "--activation-samples",
-        type=int,
-        default=11,
-    )
-
-    parser.add_argument(
-        "--feasibility-tol",
-        type=float,
-        default=1e-4,
-    )
-
-    parser.add_argument(
-        "--projection-tol",
-        type=float,
-        default=1e-8,
-    )
-
     parser.add_argument(
         "--no-project-warm-start",
         dest="project_warm_start",
         action="store_false",
     )
-
-    parser.set_defaults(
-        project_warm_start=True
-    )
+    parser.set_defaults(project_warm_start=True)
 
     parser.add_argument(
-        "--debug-all",
-        action="store_true",
+        "--debug-all", action="store_true"
     )
-
     parser.add_argument(
-        "--debug-projection",
-        action="store_true",
+        "--debug-projection", action="store_true"
     )
-
     parser.add_argument(
-        "--n-obstacles",
-        type=int,
-        default=3,
+        "--show-plots", action="store_true"
     )
 
+    # Obstacle configuration.
     parser.add_argument(
-        "--obstacle-radius",
-        type=float,
-        default=0.06,
+        "--n-obstacles", type=int, default=3
     )
-
     parser.add_argument(
-        "--safety-distance",
-        type=float,
-        default=0.02,
+        "--obstacle-radius", type=float, default=0.06
     )
-
     parser.add_argument(
-        "--nominal-clearance-min",
-        type=float,
-        default=0.03,
+        "--safety-distance", type=float, default=0.02
     )
-
     parser.add_argument(
-        "--nominal-clearance-max",
-        type=float,
-        default=0.05,
+        "--nominal-clearance-min", type=float, default=0.03
     )
-
+    parser.add_argument(
+        "--nominal-clearance-max", type=float, default=0.05
+    )
     parser.add_argument(
         "--nominal-feasibility-buffer",
-        type=float,
-        default=0.002,
+        type=float, default=0.002,
     )
-
     parser.add_argument(
-        "--anchor-capsule",
-        type=str,
-        default="bracelet",
+        "--anchor-capsule", type=str, default="bracelet"
     )
-
     parser.add_argument(
-        "--placement-samples",
-        type=int,
-        default=101,
+        "--placement-samples", type=int, default=101
     )
-
     parser.add_argument(
-        "--placement-shifts",
-        type=int,
-        default=16,
+        "--placement-shifts", type=int, default=16
     )
-
     parser.add_argument(
-        "--max-obstacle-shift",
-        type=float,
-        default=0.5,
+        "--max-obstacle-shift", type=float, default=0.5
     )
-
     parser.add_argument(
-        "--reference-check-points",
-        type=int,
-        default=401,
+        "--reference-check-points", type=int, default=401
     )
-
     parser.add_argument(
-        "--initial-buffer",
-        type=float,
-        default=0.04,
+        "--initial-buffer", type=float, default=0.04
     )
-
     parser.add_argument(
-        "--min-sphere-gap",
-        type=float,
-        default=0.05,
+        "--min-sphere-gap", type=float, default=0.05
     )
-
     parser.add_argument(
-        "--time-placement-weight",
-        type=float,
-        default=0.005,
+        "--time-placement-weight", type=float, default=0.005
     )
 
     parser.add_argument(
@@ -1957,37 +1564,22 @@ def main():
         ),
     )
 
-    parser.add_argument(
-        "--show-plots",
-        action="store_true",
-    )
-
     args = parser.parse_args()
 
     if not 0 < args.dt < args.horizon:
-        parser.error(
-            "Require 0 < dt < horizon."
-        )
+        parser.error("Require 0 < dt < horizon")
 
     if args.steps * args.dt > DURATION + 1e-9:
-        parser.error(
-            "Simulation exceeds reference duration."
-        )
+        parser.error("Simulation exceeds reference duration")
 
     if args.n_obstacles < 1:
-        parser.error(
-            "n-obstacles must be >= 1."
-        )
+        parser.error("At least one obstacle is required")
 
     if args.noise_std < 0:
-        parser.error(
-            "noise-std must be non-negative."
-        )
+        parser.error("Noise standard deviation must be >= 0")
 
     if any(i < 1 for i in args.gn_iters):
-        parser.error(
-            "GN iterations must be positive."
-        )
+        parser.error("GN iterations must be >= 1")
 
     args.output.mkdir(
         parents=True,
@@ -2001,66 +1593,66 @@ def main():
         end_effector_frame="end_effector_link",
     )
 
-    print("\n" + "=" * 90)
-    print("KINOVA MPC — NATIVE FEASIBLE WARM START")
-    print("=" * 90)
+    print("\n" + "=" * 115)
+    print("KINOVA GEN3 - CARTESIAN MPC BENCHMARK")
+    print("PHASE 1 - WARM START + FINAL FEASIBILITY VALIDATION")
+    print("=" * 115)
+
+    print("\nGenerating static obstacles...")
 
     (
         obstacles,
         environment,
         placement,
         nominal_data,
-    ) = generate_obstacles(
-        robot, args
-    )
+    ) = generate_obstacles(robot, args)
 
     print("\nOBSTACLE PLACEMENT")
+    print("-" * 90)
 
-    for i, (obstacle, info) in enumerate(
+    for j, (obstacle, info) in enumerate(
         zip(obstacles, placement)
     ):
         print(
-            f"O{i+1} | "
+            f"Obstacle {j+1} | "
             f"center={np.round(obstacle.center, 4)} | "
             f"radius={obstacle.radius:.3f} m | "
-            f"closest t={info['closest_time']:.2f}s | "
-            f"nominal clearance="
-            f"{info['min_clearance']:.4f} m"
+            f"closest_t={info['closest_time']:.2f} s | "
+            f"nominal_clearance={info['min_clearance']:.4f} m"
         )
 
     print("\nMPC CONFIGURATION")
+    print("-" * 90)
+    print(f"Time step              : {args.dt:.3f} s")
+    print(f"Horizon                : {args.horizon:.3f} s")
+    print(f"Simulation steps       : {args.steps}")
+    print(f"GN budgets             : {args.gn_iters}")
+    print(f"Control points         : {args.control_points}")
+    print(f"Tracking samples       : {args.tracking_points}")
+    print(f"Collision samples      : {args.collision_points}")
+    print(f"Acceleration noise std : {args.noise_std}")
+    print(f"Random seed            : {args.seed}")
+    print(f"Warm-start projection  : {args.project_warm_start}")
+    print(f"Projection tolerance   : {args.projection_tol:.1e}")
+    print(f"Safety distance        : {args.safety_distance:.3f} m")
+    print(f"Activation distance    : {args.activation_distance:.3f} m")
+    print(f"Output directory       : {args.output}")
 
-    print(f"dt: {args.dt:.3f} s")
-    print(f"Horizon: {args.horizon:.3f} s")
-    print(f"GN iteration budgets: {args.gn_iters}")
-    print(f"Acceleration noise std: {args.noise_std}")
-    print(f"Native projection: {args.project_warm_start}")
-    print(f"Projection tolerance: {args.projection_tol:.1e}")
-    print(f"Safety distance: {args.safety_distance:.3f} m")
-    print(f"Activation distance: {args.activation_distance:.3f} m")
+    rng = np.random.default_rng(args.seed)
 
-    rng = np.random.default_rng(
-        args.seed
-    )
-
+    # Shared disturbances ensure fair comparisons.
     disturbances = rng.normal(
         0.0,
         args.noise_std,
         size=(args.steps, robot.nv),
     )
 
-    runs = []
-
-    runs.append(
+    runs = [
         simulate(
-            "OPEN",
-            robot,
-            environment,
-            args,
-            disturbances,
-            "OPEN",
+            "OPEN", robot, environment,
+            args, disturbances, "OPEN",
         )
-    )
+    ]
 
     for iters in args.gn_iters:
         runs.append(
@@ -2071,7 +1663,7 @@ def main():
                 args,
                 disturbances,
                 "FREE",
-                iters,
+                gn_iters=iters,
             )
         )
 
@@ -2083,18 +1675,17 @@ def main():
                 args,
                 disturbances,
                 "SAFE",
-                iters,
+                gn_iters=iters,
             )
         )
 
     summaries = [
-        summarize(run, args)
-        for run in runs
+        summarize(run, args) for run in runs
     ]
 
-    print("\n" + "=" * 120)
-    print("BENCHMARK SUMMARY")
-    print("=" * 120)
+    print("\n" + "=" * 125)
+    print("FINAL BENCHMARK SUMMARY")
+    print("=" * 125)
 
     print(
         f"{'Experiment':<15}"
@@ -2104,7 +1695,8 @@ def main():
         f"{'P95 ms':>11}"
         f"{'Pos RMS':>11}"
         f"{'Min clear':>12}"
-        f"{'Projections':>13}"
+        f"{'Projected':>12}"
+        f"{'Rejected':>11}"
         f"{'GN max':>13}"
     )
 
@@ -2117,20 +1709,41 @@ def main():
             f"{s['p95_ms']:>11.2f}"
             f"{s['position_rms_mm']:>11.3f}"
             f"{s['min_clearance_m']:>12.4f}"
-            f"{s['projection_cycles']:>13}"
+            f"{s['projection_cycles']:>12}"
+            f"{s['rejected_solutions']:>11}"
             f"{s['max_gn_violation']:>13.2e}"
         )
 
         if s["failure"]:
-            print(
-                f"    Failure: {s['failure']}"
-            )
+            print("    FAILURE:", s["failure"])
 
-    export_csv(
-        runs,
-        summaries,
-        args.output,
-    )
+    print("\nDETAILED MPC STATISTICS")
+    print("-" * 100)
+
+    for s in summaries:
+        print(f"\n{s['experiment']}")
+        print(f"  Complete              : {s['complete']}")
+        print(f"  Successful cycles     : {s['cycles']}/{args.steps}")
+        print(f"  Accepted GN solutions : {s['accepted_solutions']}")
+        print(f"  Rejected GN solutions : {s['rejected_solutions']}")
+        print(f"  Mean compute          : {s['mean_ms']:.3f} ms")
+        print(f"  Median compute        : {s['median_ms']:.3f} ms")
+        print(f"  P95 compute           : {s['p95_ms']:.3f} ms")
+        print(f"  Max compute           : {s['max_ms']:.3f} ms")
+        print(f"  Position RMS          : {s['position_rms_mm']:.3f} mm")
+        print(f"  Orientation RMS       : {s['orientation_rms_deg']:.3f} deg")
+        print(f"  Joint error RMS       : {s['joint_rms_rad']:.5f} rad")
+        print(f"  Minimum clearance     : {s['min_clearance_m']:.5f} m")
+        print(f"  Clearance violations  : {s['clearance_violation_cycles']}")
+        print(f"  Active obstacle cycles: {s['active_cycles']}")
+        print(f"  Projection cycles     : {s['projection_cycles']}")
+        print(f"  Mean projection time  : {s['projection_mean_ms']:.3f} ms")
+        print(f"  Max warm violation    : {s['max_warm_violation']:.3e}")
+        print(f"  Max GN violation      : {s['max_gn_violation']:.3e}")
+
+    export_csv(runs, summaries, args.output)
+
+    print("\nGenerating figures...")
 
     plot_results(
         robot,
@@ -2140,10 +1753,20 @@ def main():
         nominal_data,
     )
 
-    print(
-        "\nOutput directory:",
-        args.output,
-    )
+    print("\n" + "=" * 90)
+    print("BENCHMARK FINISHED")
+    print("=" * 90)
+    print("Results saved to:", args.output)
+    print("  - cycles.csv")
+    print("  - summary.csv")
+    print("  - tracking_errors.png")
+    print("  - joint_tracking.png")
+    print("  - obstacle_clearances.png")
+    print("  - mpc_timing.png")
+    print("  - warm_start_feasibility.png")
+    print("  - obstacle_activation.png")
+    print("  - trajectories_3d.png")
+    print("  - mpc_diagnostics.png")
 
 
 if __name__ == "__main__":
