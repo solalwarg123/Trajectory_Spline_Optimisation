@@ -56,13 +56,15 @@ def display_pose(
         Name of the object in the Meshcat scene.
 
     scale:
-        Length of the XYZ axes.
+        Positive length of the XYZ axes, in meters.
     """
 
     if not isinstance(pose, pin.SE3):
         raise TypeError(
             "pose must be a pinocchio.SE3 object."
         )
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise ValueError("scale must be finite and positive.")
 
     node = viewer.viewer["targets"][name]
 
@@ -92,29 +94,39 @@ def animate_configurations(
     dt=0.03,
 ):
     """
-    Sequentially display robot configurations.
+    Animate a sequence of robot configurations in Meshcat.
 
     Parameters
     ----------
-    viewer:
-        Pinocchio MeshcatVisualizer.
+    viewer : pinocchio.visualize.MeshcatVisualizer
+        Initialized robot viewer.
+    q_sequence : array-like, shape (N, nq)
+        Sequence of configurations in Pinocchio coordinates.
+    dt : float
+        Delay between consecutive configurations in seconds.
 
-    q_sequence:
-        Array-like of shape (N, nq).
-
-    dt:
-        Delay between configurations in seconds.
+    Notes
+    -----
+    Animation uses time.sleep and is therefore blocking.
+    It is intended for visualization, not real-time control.
     """
-
-    q_sequence = np.asarray(
-        q_sequence,
-        dtype=float,
-    )
+    q_sequence = np.asarray(q_sequence, dtype=float)
 
     if q_sequence.ndim != 2:
+        raise ValueError("q_sequence must have shape (N, nq).")
+
+    if q_sequence.shape[1] != viewer.model.nq:
         raise ValueError(
-            "q_sequence must have shape (N, nq)."
+            f"Expected {viewer.model.nq} configuration values, "
+            f"got {q_sequence.shape[1]}."
         )
+
+    if not np.all(np.isfinite(q_sequence)):
+        raise ValueError("q_sequence must contain finite values.")
+
+    dt = float(dt)
+    if not np.isfinite(dt) or dt < 0.0:
+        raise ValueError("dt must be finite and non-negative.")
 
     for q in q_sequence:
         viewer.display(q)
