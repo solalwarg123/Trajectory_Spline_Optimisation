@@ -149,15 +149,30 @@ class ConstraintProblem(FakeProblem):
 
 
 class FixedSolver(FakeSolver):
-    def __init__(self, control_points):
+    def __init__(self, control_points, success=True):
         super().__init__()
-        self.returned = np.asarray(control_points, dtype=float)
 
-    def solve(self, problem, initial_control_points, verbose=False):
+        self.returned = np.asarray(
+            control_points,
+            dtype=float,
+        )
+
+        self.succeed = bool(success)
+
+    def solve(
+        self,
+        problem,
+        initial_control_points,
+        verbose=False,
+    ):
         return SimpleNamespace(
             control_points=self.returned.copy(),
-            success=True,
-            status="converged",
+            success=self.succeed,
+            status=(
+                "converged"
+                if self.succeed
+                else "max_iterations"
+            ),
         )
 
 
@@ -223,10 +238,127 @@ def test_mpc_accepts_feasible_max_iterations():
 
     assert mpc.last_solution_info["accepted"]
     assert not mpc.last_solution_info["solver_success"]
-    assert mpc.last_solution_info["solver_usable"]
     assert mpc.last_solution_info["linear_feasible"]
 
     np.testing.assert_allclose(
         mpc.previous_control_points,
         result.control_points,
+    )
+
+
+def test_mpc_accepts_feasible_nonconverged_solution():
+    expected = np.full((4, 2), 0.25)
+
+    solver = FixedSolver(
+        expected,
+        success=False,
+    )
+
+    mpc = CartesianMPC(
+        ConstraintProblem(),
+        solver,
+        np.zeros((4, 2)),
+        project_warm_start=False,
+    )
+
+    result = mpc.step(
+        np.zeros(2),
+        np.zeros(2),
+        [],
+    )
+
+    assert not result.success
+    assert mpc.last_solution_info["accepted"]
+    assert mpc.last_solution_info["solution_source"] == "gn"
+
+    np.testing.assert_allclose(
+        mpc.previous_control_points,
+        expected,
+    )
+
+
+def test_mpc_falls_back_to_feasible_projected_guess():
+    solver = FixedSolver(
+        np.ones((4, 2)),
+        success=False,
+    )
+
+    mpc = CartesianMPC(
+        ConstraintProblem(),
+        solver,
+        np.zeros((4, 2)),
+        project_warm_start=True,
+    )
+
+    # Simulate a previously projected feasible warm start.
+    # No real OSQP call is needed in this unit test.
+    c_projected = np.full((4, 2), 0.15)
+
+    mpc._prepare_warm_start = (
+        lambda q0, v0: c_projected.copy()
+    )
+
+    result = mpc.step(
+        np.zeros(2),
+        np.zeros(2),
+        [],
+    )
+
+    assert not result.success
+    assert mpc.last_solution_info["accepted"]
+    assert mpc.last_solution_info["fallback_used"]
+
+    assert (
+        mpc.last_solution_info["solution_source"]
+        == "projected_warm_start"
+    )
+
+    np.testing.assert_allclose(
+        result.control_points,
+        c_projected,
+    )
+
+    np.testing.assert_allclose(
+        mpc.previous_control_points,
+        c_projected,
+    )
+
+
+def test_mpc_does_not_accept_infeasible_fallback():
+    solver = FixedSolver(
+        np.ones((4, 2)),
+        success=False,
+    )
+
+    initial = np.zeros((4, 2))
+
+    mpc = CartesianMPC(
+        ConstraintProblem(),
+        solver,
+        initial,
+        project_warm_start=True,
+    )
+
+    # Deliberately infeasible fallback.
+    mpc._prepare_warm_start = (
+        lambda q0, v0: np.full((4, 2), 0.7)
+    )
+
+    result = mpc.step(
+        np.zeros(2),
+        np.zeros(2),
+        [],
+    )
+
+    assert not mpc.last_solution_info["accepted"]
+    assert not mpc.last_solution_info["fallback_used"]
+
+    np.testing.assert_allclose(
+        result.control_points,
+        np.ones((4, 2)),
+    )
+
+    np.testing.assert_allclose(
+        mpc.previous_control_points,
+        initial,
     )

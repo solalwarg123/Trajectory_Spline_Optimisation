@@ -559,60 +559,75 @@ class CartesianMPC:
             tolerance=self.collision_feasibility_tolerance,
         )
 
-    def _validate_result(self, result, collision_feasible=None):
-        """Accept feasible MPC iterates, including iteration-limited GN."""
-
+    def _validate_result(self, result, *, collision_feasible=None):
+        """
+        Accept a finite, feasible trajectory even if GN
+        did not reach its convergence criterion.
+        """
         c = self._control_points(result)
-        finite = np.all(np.isfinite(c))
 
-        if hasattr(self.problem, "linear_constraints"):
-            A, lower, upper = self.problem.linear_constraints()
-
-            violation = (
-                self._linear_violation(c, A, lower, upper)
-                if finite else np.inf
-            )
-
-            linear_feasible = (
-                np.isfinite(violation)
-                and violation <= self.linear_feasibility_tolerance
-            )
-        else:
-            violation = None
-            linear_feasible = bool(finite)
-
-        status = str(getattr(result, "status", ""))
-
-        # A maximum-iteration exit is expected with a fixed
-        # MPC computational budget.
-        solver_usable = (
-            bool(result.success)
-            or status == "max_iterations"
+        has_linear_constraints = hasattr(
+            self.problem, "linear_constraints"
         )
 
+        if has_linear_constraints:
+            A, lower, upper = self.problem.linear_constraints()
+
+            violation = self._linear_violation(
+                c, A, lower, upper
+            )
+
+            tolerance = getattr(
+                self,
+                "linear_feasibility_tolerance",
+                self.projection_tolerance,
+            )
+
+            linear_feasible = bool(violation <= tolerance)
+
+        else:
+            # Preserve compatibility with lightweight test doubles.
+            violation = None
+            linear_feasible = True
+
+        solver_success = bool(
+            getattr(result, "success", False)
+        )
+
+        collision_ok = collision_feasible is not False
+
+        # For real constrained problems, feasibility determines
+        # acceptance, NOT convergence of Gauss-Newton.
+        #
+        # Lightweight test doubles without linear constraints
+        # retain the previous solver-status-based behavior.
         accepted = (
-            solver_usable
-            and finite
-            and linear_feasible
-            and collision_feasible is not False
+            (
+                linear_feasible
+                if has_linear_constraints
+                else solver_success
+            )
+            and collision_ok
         )
 
         self.last_solution_info = {
-            "solver_success": bool(result.success),
-            "solver_status": status,
-            "solver_usable": bool(solver_usable),
-            "coefficients_finite": bool(finite),
+            "solver_success": solver_success,
+            "solver_status": str(
+                getattr(result, "status", "unknown")
+            ),
             "linear_violation": violation,
-            "linear_feasible": bool(linear_feasible),
+            "linear_feasible": linear_feasible,
             "collision_feasible": collision_feasible,
             "accepted": bool(accepted),
         }
 
-        return accepted
+        return bool(accepted)
 
-    def _commit(self, result, collision_feasible=None):
-        """Store the solution only if it is valid."""
-
+    def _commit(self, result, *, collision_feasible=None):
+        """
+        Retain any feasible solution, regardless of
+        whether Gauss-Newton has converged.
+        """
         if self._validate_result(
             result,
             collision_feasible=collision_feasible,
@@ -620,6 +635,153 @@ class CartesianMPC:
             self.previous_control_points = (
                 self._control_points(result).copy()
             )
+            return True
+
+        return False
+
+    def _finalize_solution(
+        self,
+        result,
+        c_init,
+        *,
+        has_collisions=False,
+        collision_feasible=None,
+    ):
+        """
+        Choose the trajectory actually executed by MPC.
+
+        Priority:
+        1. Feasible Gauss-Newton solution.
+        2. Feasible projected warm start.
+        3. No accepted solution.
+
+        Convergence is recorded but is not required.
+
+        The returned result always contains the selected
+        control points if a feasible candidate is available.
+        """
+        from copy import copy
+
+        # --------------------------------------------------
+        # Candidate 1: Gauss-Newton result
+        # --------------------------------------------------
+
+        try:
+            if has_collisions and collision_feasible is None:
+                collision_feasible = bool(
+                    self._full_collision_feasible(
+                        self._control_points(result)
+                    )
+                )
+
+            if self._commit(
+                result,
+                collision_feasible=collision_feasible,
+            ):
+                self.last_solution_info.update({
+                    "solution_source": "gn",
+                    "fallback_used": False,
+                })
+
+                return result
+
+        except (RuntimeError, ValueError) as exc:
+            # Invalid control point dimension or non-finite
+            # solver result. Do not execute this candidate.
+            self.last_solution_info = {
+                "solver_success": bool(
+                    getattr(result, "success", False)
+                ),
+                "solver_status": str(
+                    getattr(result, "status", "unknown")
+                ),
+                "linear_violation": np.inf,
+                "linear_feasible": False,
+                "collision_feasible": collision_feasible,
+                "accepted": False,
+                "invalid_result_reason": str(exc),
+            }
+
+        gn_info = dict(self.last_solution_info)
+
+        # --------------------------------------------------
+        # Candidate 2: projected warm start
+        # --------------------------------------------------
+
+        # Without projection, the previous trajectory may
+        # not satisfy the current initial position/velocity.
+        if (
+            not self.project_warm_start
+            or not hasattr(self.problem, "linear_constraints")
+        ):
+            self.last_solution_info.update({
+                "solution_source": "none",
+                "fallback_used": False,
+            })
+
+            return result
+
+        # Keep the original GN result untouched.
+        fallback_result = copy(result)
+
+        fallback_result.control_points = np.asarray(
+            c_init,
+            dtype=float,
+        ).copy()
+
+        try:
+            # A linear projection does not guarantee collision
+            # feasibility: verify collisions independently.
+            fallback_collision_ok = (
+                bool(
+                    self._full_collision_feasible(
+                        self._control_points(fallback_result)
+                    )
+                )
+                if has_collisions
+                else None
+            )
+
+            fallback_accepted = self._commit(
+                fallback_result,
+                collision_feasible=fallback_collision_ok,
+            )
+
+        except (RuntimeError, ValueError):
+            fallback_accepted = False
+
+        if fallback_accepted:
+            self.last_solution_info.update({
+                "solution_source": "projected_warm_start",
+                "fallback_used": True,
+                "gn_linear_violation": gn_info.get(
+                    "linear_violation"
+                ),
+                "gn_solver_status": gn_info.get(
+                    "solver_status"
+                ),
+            })
+
+            if (
+                has_collisions
+                and self.last_collision_info is not None
+            ):
+                self.last_collision_info["feasible"] = True
+
+            return fallback_result
+
+        # --------------------------------------------------
+        # No feasible candidate
+        # --------------------------------------------------
+
+        self.last_solution_info = gn_info
+
+        self.last_solution_info.update({
+            "solution_source": "none",
+            "fallback_used": False,
+        })
+
+        return result
 
     # ======================================================
     # MPC step
@@ -637,23 +799,40 @@ class CartesianMPC:
         Update and solve the current MPC horizon.
 
         1. Update current state and target poses.
-        2. Rebase and project warm start.
+        2. Rebase and project the warm start.
         3. Select nearby obstacles if enabled.
         4. Solve the trajectory optimization.
         5. Detect newly approached obstacles.
         6. Re-solve if necessary.
-        7. Verify final feasibility before committing.
+        7. Verify collision constraints.
+        8. Select a feasible trajectory for execution.
+
+        A trajectory does NOT need GN convergence to be accepted.
+
+        Selection priority:
+            1. Feasible GN solution.
+            2. Feasible projected warm start.
+            3. Rejection if neither is feasible.
         """
 
-        # Update current problem.
+        # ==================================================
+        # 1. Update current MPC problem
+        # ==================================================
+
         self.problem.update(
             q0=q0,
             v0=v0,
             target_poses=target_poses,
         )
 
-        # Prepare feasible initial guess.
-        c_init = self._prepare_warm_start(q0, v0)
+        # ==================================================
+        # 2. Prepare a feasible warm start
+        # ==================================================
+
+        c_init = self._prepare_warm_start(
+            q0,
+            v0,
+        )
 
         full = self._full_collision
 
@@ -662,48 +841,59 @@ class CartesianMPC:
             and full.has_constraints
         )
 
-        # --------------------------------------------------
-        # Original MPC path (without obstacle filtering)
-        # --------------------------------------------------
+        # ==================================================
+        # 3. Standard MPC path
+        # ==================================================
+        #
+        # No collision constraints, or collision filtering
+        # disabled.
+        #
+        # GN convergence is NOT required.
+        # Feasibility is checked by _finalize_solution().
+        # ==================================================
 
         if (
             not has_collisions
             or self.collision_activation_distance is None
         ):
+
             result = self.solver.solve(
                 problem=self.problem,
                 initial_control_points=c_init,
                 verbose=verbose,
             )
 
-            collision_feasible = (
-                self._full_collision_feasible(
-                    self._control_points(result)
-                )
-                if has_collisions else None
-            )
-
             self.last_collision_info = {
                 "filtered": False,
                 "active_indices": (
-                    tuple(range(full.environment.n_obstacles))
-                    if has_collisions else ()
+                    tuple(
+                        range(
+                            full.environment.n_obstacles
+                        )
+                    )
+                    if has_collisions
+                    else ()
                 ),
                 "solve_count": 1,
-                "feasible": collision_feasible,
+                "feasible": None,
             }
 
-            self._commit(
+            return self._finalize_solution(
                 result,
-                collision_feasible=collision_feasible,
+                c_init,
+                has_collisions=has_collisions,
             )
-            return result
 
-        # --------------------------------------------------
-        # Select obstacles near initial guess
-        # --------------------------------------------------
+        # ==================================================
+        # 4. Collision filtering
+        # ==================================================
+        #
+        # Select obstacles near the initial trajectory.
+        # ==================================================
 
-        active = set(self._near_obstacles(c_init))
+        active = set(
+            self._near_obstacles(c_init)
+        )
 
         result = self._solve_with(
             constraints=self._collision_builder(active),
@@ -712,15 +902,19 @@ class CartesianMPC:
         )
 
         solves = 1
+
         c = self._control_points(result)
 
-        # --------------------------------------------------
-        # Detect newly approached obstacles
-        # --------------------------------------------------
+        # ==================================================
+        # 5. Detect newly approached obstacles
+        # ==================================================
 
-        newly_near = set(self._near_obstacles(c))
+        newly_near = set(
+            self._near_obstacles(c)
+        )
 
         if not newly_near.issubset(active):
+
             active |= newly_near
 
             result = self._solve_with(
@@ -730,20 +924,25 @@ class CartesianMPC:
             )
 
             solves += 1
+
             c = self._control_points(result)
 
-        # --------------------------------------------------
-        # Final verification against all obstacles
-        # --------------------------------------------------
+        # ==================================================
+        # 6. Verify all collision constraints
+        # ==================================================
 
         feasible = self._full_collision_feasible(c)
 
         if not feasible:
+
             all_indices = set(
-                range(full.environment.n_obstacles)
+                range(
+                    full.environment.n_obstacles
+                )
             )
 
             if active != all_indices:
+
                 active = all_indices
 
                 result = self._solve_with(
@@ -753,26 +952,53 @@ class CartesianMPC:
                 )
 
                 solves += 1
+
                 c = self._control_points(result)
 
-                feasible = self._full_collision_feasible(c)
+                feasible = (
+                    self._full_collision_feasible(c)
+                )
+
+        # ==================================================
+        # 7. Store collision diagnostics
+        # ==================================================
 
         self.last_collision_info = {
             "filtered": True,
-            "active_indices": tuple(sorted(active)),
+            "active_indices": tuple(
+                sorted(active)
+            ),
             "active_count": len(active),
-            "total_obstacles": full.environment.n_obstacles,
+            "total_obstacles": (
+                full.environment.n_obstacles
+            ),
             "solve_count": solves,
             "feasible": bool(feasible),
         }
 
-        # --------------------------------------------------
-        # Validate solution and update warm start
-        # --------------------------------------------------
+        # ==================================================
+        # 8. Select the trajectory to execute
+        # ==================================================
+        #
+        # _finalize_solution() applies:
+        #
+        #   GN feasible:
+        #       accept, regardless of solver.success.
+        #
+        #   GN infeasible:
+        #       fall back to projected warm start,
+        #       provided it is feasible.
+        #
+        #   Neither feasible:
+        #       reject.
+        #
+        # Collision constraints are also checked
+        # for the selected trajectory.
+        # ==================================================
 
-        self._commit(
+        return self._finalize_solution(
             result,
+            c_init,
+            has_collisions=True,
             collision_feasible=bool(feasible),
         )
-
-        return result
