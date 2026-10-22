@@ -406,6 +406,9 @@ class JointTrajectoryOptimizer:
             u=u,
             verbose=verbose,
             polishing=True,
+            eps_abs=1e-7,
+            eps_rel=1e-7,
+            max_iter=20000,
         )
 
         result = solver.solve()

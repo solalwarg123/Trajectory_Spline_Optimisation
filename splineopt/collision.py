@@ -1078,3 +1078,122 @@ class CollisionConstraintBuilder:
             values,
             jacobian,
         )
+
+    def near_obstacle_indices(
+        self,
+        control_points,
+        activation_distance,
+        n_samples=11,
+    ):
+        """
+        Return indices of obstacles close to a trajectory.
+
+        All robot capsules are checked against all obstacles.
+        An obstacle is selected if at least one capsule
+        approaches it within activation_distance.
+
+        This is a sampled geometric broad-phase, not a
+        continuous collision certificate.
+        """
+        if not np.isfinite(activation_distance):
+            raise ValueError(
+                "activation_distance must be finite."
+            )
+
+        if activation_distance < 0.0:
+            raise ValueError(
+                "activation_distance must be non-negative."
+            )
+
+        if n_samples < 2:
+            raise ValueError("n_samples must be >= 2.")
+
+        env = self.environment
+        n_obs = env.n_obstacles
+
+        if n_obs == 0:
+            return ()
+
+        c = np.asarray(
+            control_points, dtype=float
+        ).reshape(-1)
+
+        if c.size != self.n_variables:
+            raise ValueError(
+                "Invalid control point vector size."
+            )
+
+        if not np.all(np.isfinite(c)):
+            raise ValueError(
+                "Control points must be finite."
+            )
+
+        active = np.zeros(n_obs, dtype=bool)
+
+        times = np.linspace(
+            self.spline.t_start,
+            self.spline.t_end,
+            n_samples,
+        )
+
+        for t in times:
+            A = self.spline.evaluation_matrix(
+                t, derivative_order=0
+            )
+            q = A @ c
+
+            distances, _ = env.evaluate(
+                q, compute_jacobian=False
+            )
+
+            # CollisionEnvironment orders pairs as:
+            # capsule 0 / obstacle 0..N,
+            # capsule 1 / obstacle 0..N, etc.
+            distances = distances.reshape(
+                env.n_capsules, n_obs
+            )
+
+            active |= np.any(
+                distances <= activation_distance,
+                axis=0,
+            )
+
+            if np.all(active):
+                break
+
+        return tuple(np.flatnonzero(active).tolist())
+
+    def subset_for_obstacles(self, obstacle_indices):
+        """
+        Create constraints for selected obstacles only.
+
+        All robot capsules are preserved.
+        The same spline, collocation grid and safety
+        distance are used.
+        """
+        indices = tuple(obstacle_indices)
+
+        if len(indices) != len(set(indices)):
+            raise ValueError("Duplicate obstacle indices.")
+
+        if any(
+            i < 0 or i >= self.environment.n_obstacles
+            for i in indices
+        ):
+            raise ValueError("Invalid obstacle index.")
+
+        environment = CollisionEnvironment(
+            robot=self.environment.robot,
+            capsules=self.environment.capsules,
+            obstacles=[
+                self.environment.obstacles[i]
+                for i in indices
+            ],
+        )
+
+        return CollisionConstraintBuilder(
+            spline=self.spline,
+            environment=environment,
+            collocation_times=self.collocation_times,
+            safety_distance=self.safety_distance,
+        )

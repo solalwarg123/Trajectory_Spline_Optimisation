@@ -1,22 +1,22 @@
 # B-Spline Trajectory Optimization for Robot Motion
 
-A lightweight trajectory optimization framework for generating smooth and feasible robot motions using B-splines.
+A lightweight trajectory optimization framework for generating smooth, constrained robot motions using B-splines, from offline trajectory projection to receding-horizon Cartesian MPC.
 
 ```text
 High-level policy / planner
-            ↓
-     trajectory reference
-            ↓
-   B-spline representation
-            ↓
- joint-space QP / Cartesian GN
-            ↓
- smooth feasible trajectory
-            ↓
-      robot controller
+        ↓
+trajectory reference
+        ↓
+B-spline representation
+        ↓
+joint-space QP / Cartesian GN / MPC
+        ↓
+smooth feasible trajectory
+        ↓
+robot controller
 ```
 
-The project focuses on **B-spline trajectory optimization in both joint and Cartesian space**, with integration and visualization on a **Kinova Gen3 7-DoF robot** using Pinocchio and Meshcat.
+The project covers **joint-space and Cartesian B-spline trajectory optimization**, nonlinear collision avoidance, and closed-loop Cartesian MPC, demonstrated on a **Kinova Gen3 7-DoF robot** using Pinocchio and Meshcat.
 
 The current implementation includes:
 
@@ -26,6 +26,8 @@ joint-space convex projection
 direct Cartesian optimization
         +
 continuous-time joint constraints
+        +
+collision-aware receding-horizon MPC
 ```
 
 The joint-space formulation provides a convex baseline, while the Cartesian formulation directly optimizes the B-spline control points according to end-effector tracking objectives.
@@ -158,6 +160,11 @@ The project currently includes:
 - position-only and full SE(3) tracking objectives;
 - constrained Gauss-Newton iterations with OSQP subproblems;
 - terminal Cartesian tracking cost;
+- adaptive Levenberg–Marquardt damping and an IPOPT comparison baseline;
+- capsule–sphere collision constraints with sampled collocation checks;
+- cached collision-geometry computations and optional per-obstacle activation;
+- receding-horizon Cartesian MPC with disturbance rejection;
+- native OSQP projection of infeasible MPC warm starts onto updated linear constraints;
 - joint-space / Cartesian baseline comparison;
 - Meshcat visualization and animation;
 - regression tests for the B-spline, robotics and Cartesian optimization layers.
@@ -186,19 +193,19 @@ The first Kinova demonstration uses the following pipeline:
 
 ```text
 Virtual joint trajectory
-          ↓
+        ↓
 Pinocchio forward kinematics
-          ↓
+        ↓
 Cartesian target trajectory
-          ↓
+        ↓
 Sequential SE(3) IK
-          ↓
+        ↓
 Nominal joint trajectory
-          ↓
+        ↓
 Constrained B-spline projection
-          ↓
+        ↓
 Smooth feasible trajectory
-          ↓
+        ↓
 Pinocchio forward kinematics
 ```
 
@@ -445,9 +452,9 @@ The combination used in the Kinova demonstration is therefore:
 
 ```text
 strong final Cartesian tracking
-            +
+        +
 zero final joint velocity
-            +
+        +
 free final joint configuration
 ```
 
@@ -641,9 +648,9 @@ The experiment therefore highlights the main advantage of the B-spline formulati
 
 ```text
 direct Cartesian tracking
-          +
+        +
 smooth joint motion
-          +
+        +
 continuous-time q / v / a constraints
 ```
 
@@ -655,7 +662,7 @@ On the current Kinova Cartesian tracking benchmark, the benefits were mixed. For
 
 For position-only tracking, adaptive damping performed worse than the fixed strategy: the dense position RMS error was **10.41 mm**, compared with approximately **9.00 mm** using fixed damping.
 
-Adaptive damping also introduces additional QP solves when the line search fails and the step is recomputed with increased damping. Given the limited and problem-dependent improvements observed so far, **fixed damping remains the default strategy**, while adaptive damping is kept as an experimental option. Its usefulness will be reassessed in a future receding-horizon setting, where robustness must be balanced against computation time. We could also try a new damping strategy being static in the beginning and adaptative at the end when we start to really need it.
+Adaptive damping also introduces additional QP solves when the line search fails and the step is recomputed with increased damping. Given the limited and problem-dependent improvements observed so far, **fixed damping remains the default strategy**, while adaptive damping is kept as an experimental option. The MPC experiments use adaptive damping; its additional robustness must still be balanced against computation time.
 
 ### Solver benchmark
 
@@ -663,17 +670,108 @@ A small benchmark was conducted on five Kinova Gen3 trajectory scenarios with in
 
 IPOPT with a limited-memory BFGS Hessian approximation reaches slightly better final solutions when allowed to run for many iterations, especially for orientation tracking and the most constrained scenarios. However, this comes at a much larger computational cost: IPOPT with 200 iterations takes about 25 s on the current benchmark, compared with about 3.5 s for Gauss-Newton. With only 20 iterations, IPOPT is faster than Gauss-Newton but remains significantly less accurate, showing that the specialized Gauss-Newton formulation exploits the least-squares structure of the problem more efficiently during the first iterations.
 
-These results motivate keeping Gauss-Newton as the main specialized solver while using IPOPT as a more general nonlinear optimization baseline. The next step is to extend the formulation with nonlinear collision-avoidance constraints.
----
+These results motivate keeping Gauss-Newton as the main specialized solver while using IPOPT as a more general nonlinear optimization baseline. Collision avoidance and receding-horizon control are discussed in the following sections.
 
+### Collision-aware Cartesian optimization
+
+The Cartesian optimization layer also supports nonlinear robot–obstacle distance constraints. Robot links are approximated with **capsules**, and static obstacles with **spheres**. Distances are evaluated using Pinocchio-based kinematics, and collision constraints are incorporated into the iterative optimization at selected trajectory collocation times.
+
+For a capsule–obstacle pair, a typical clearance requirement is
+
+```math
+d_{ij}(q(t_k;c)) \ge d_{\mathrm{safe}},
+```
+
+where $d_{ij}$ is the signed surface clearance and $d_{\mathrm{safe}}$ is a nonnegative safety margin. Unlike the joint-position, velocity, and acceleration constraints, **these nonlinear collision constraints are enforced on a finite collocation grid**; they do not constitute a continuous-time collision-avoidance guarantee.
+
+The collision-aware optimizer has been demonstrated on a Kinova Gen3 arm navigating a nearby static obstacle. The nonlinear objective and constraints are handled through successive local optimization problems, while the B-spline representation retains its continuous-time joint-limit guarantees when the returned solution is linearly feasible.
+
+For MPC, an optional sampled broad-phase identifies obstacles close to the candidate trajectory. The optimizer initially includes only those obstacles, checks the resulting trajectory for newly approached obstacles, and may re-solve with additional constraints or the full obstacle set. This reduces unnecessary nonlinear constraint evaluations but is **not a substitute for continuous collision checking**.
+
+### Online Cartesian MPC
+
+`CartesianMPC` extends the offline Cartesian optimizer to **receding-horizon tracking**. At each control cycle, it updates the measured joint position and velocity and the future Cartesian pose targets, solves a new B-spline optimization problem, and executes only the first part of the planned motion.
+
+```text
+Current robot state + future Cartesian targets
+                      ↓
+             Update MPC problem
+                      ↓
+         Rebase previous B-spline
+                      ↓
+    Project warm start if linearly infeasible
+                      ↓
+     Constrained Cartesian Gauss–Newton
+          (+ optional collisions)
+                      ↓
+        Execute first control interval
+                      ↓
+              New robot state
+```
+
+The MPC maintains continuous-time joint position, velocity and acceleration bounds through derivative-control-point constraints, subject to the feasibility and numerical accuracy of each solve. Closed-loop performance is evaluated in simulation under injected acceleration disturbances.
+
+#### Native feasible warm-start restoration
+
+A previously optimized B-spline is not necessarily feasible after the MPC initial state changes. Simply imposing the new initial position and velocity can also violate the joint derivative bounds. Starting Gauss–Newton from an infeasible iterate can cause its line search to return a constraint-violating point even when an individual QP subproblem is feasible.
+
+The MPC therefore **rebases the previous solution and, when needed, projects it onto the updated linear feasible set**:
+
+```math
+\min_c \; \frac{1}{2}\|c-c_{\mathrm{guess}}\|^2
+\qquad
+\mathrm{s.t.}\quad l_k \le A_k c \le u_k.
+```
+
+The projection uses **OSQP**, with a reusable solver workspace when the sparse constraint matrix is unchanged. This step is implemented in `CartesianMPC` (`project_warm_start=True` by default), rather than in individual examples. It restores *linear* feasibility when the feasible set is nonempty; it does not guarantee nonlinear convergence or collision feasibility.
+
+#### Closed-loop cluttered-tracking benchmark
+
+The benchmark compares open-loop execution (`OPEN`), unconstrained-by-obstacle Cartesian MPC (`FREE`) and collision-aware Cartesian MPC (`SAFE`) on the same **10-second** feasible joint trajectory. All runs use an MPC horizon of **1.5 s**, a control interval of **0.1 s (10 Hz)**, three static sphere obstacles, a **20 mm** safety margin, and Gaussian acceleration perturbations with standard deviation **0.35 rad/s²**. The suffix `GN2` or `GN5` denotes the maximum number of Gauss–Newton iterations per MPC solve.
+
+A benchmark using an **example-local feasible warm-start projection** produced the following results:
+
+| Method | Completed cycles | Mean solve time | Position RMS error | Minimum observed clearance |
+|---|---:|---:|---:|---:|
+| OPEN | 55/100 | — | 57.25 mm | −5.6 mm |
+| FREE-GN2 | 100/100 | 16.49 ms | 3.59 mm | 25.6 mm |
+| SAFE-GN2 | 100/100 | 160.94 ms | 3.59 mm | 25.5 mm |
+| FREE-GN5 | 100/100 | 36.04 ms | 3.59 mm | 25.5 mm |
+| SAFE-GN5 | 54/100 | 399.44 ms | 3.86 mm | 25.5 mm |
+
+*The times and RMS errors for incomplete runs are computed over their successfully completed cycles. These are simulation timings, not hardware-in-the-loop measurements.*
+
+Open-loop execution accumulates disturbances, violates the selected clearance margin, and eventually reaches a joint/velocity limit. Feedback MPC maintains millimeter-scale Cartesian position errors on this trial. With these particular obstacle placements, `FREE` already follows a collision-free path; accordingly, this benchmark demonstrates the **computational cost of collision constraints**, not a case in which obstacle avoidance is required for successful execution.
+
+The same experiment was subsequently run with the projection **integrated directly in `CartesianMPC`**. The native version completed all 100 cycles for FREE-GN2 and FREE-GN5, but SAFE-GN2 encountered a linear acceleration-constraint violation of approximately **7.78 × 10⁻⁴** at cycle 29, despite a feasible projected initialization. The native warm-start rebasing also caused larger pre-projection violations and intermittent extra projection cost. Thus **the native MPC refactor is functional for the tested obstacle-free configurations, but the collision-aware path still needs robustness work**. Results from the two implementations should not be conflated.
+
+The nominal controller period is 100 ms. FREE-GN2 is a promising candidate for faster experiments, but average solve time alone does not establish a 30 Hz real-time guarantee. Collision-aware MPC in this setup substantially exceeds the 100 ms cycle budget.
+
+Run the simpler closed-loop tracking example:
+
+```bash
+python -m examples.kinova_mpc_safe_tracking --mode gaussian --noise-accel-std 0.05 --max-iterations 2 --no-animation --show-plots
+```
+
+Run the cluttered-tracking comparison:
+
+```bash
+python -m examples.kinova_mpc_cluttered_tracking --gn-iters 2 5 --noise-std 0.35 --show-plots
+```
+
+The cluttered-tracking example exports per-cycle metrics, summary CSV files, and figures to `outputs/kinova_mpc_cluttered_tracking/`. The `--debug-projection` option prints warm-start feasibility diagnostics. The `--no-project-warm-start` option disables the native projection for comparison.
+
+---
 
 ## Run
 
 Run the unit tests:
 
 ```bash
-python -m pytest -v
+python -m pytest -q
 ```
+
+The current test suite includes 93 passing tests, covering the B-spline, robotic kinematics and optimization layers, and basic MPC state handling. Dedicated regression tests for **native warm-start projection** are still planned.
 
 Run the synthetic examples:
 
@@ -700,46 +798,11 @@ The Kinova examples use Pinocchio for robot kinematics and Meshcat for interacti
 
 ## Next steps
 
-The current implementation provides both a convex joint-space baseline and a direct constrained Cartesian optimizer.
+The main goal is to demonstrate a **high-level motion policy coupled to a constrained, smooth, receding-horizon B-spline trajectory optimizer**. Planned work is deliberately focused on integration and reproducibility rather than indefinitely tuning the warm start or collision solver.
 
-The next development steps focus on improving solver robustness and extending the formulation toward more general nonlinear trajectory optimization problems.
+1. **MPC robustness and tests.** Add focused tests for native warm-start projection; ensure solver termination status and linear/collision feasibility are checked independently; address the remaining collision-aware failure modes. Avoid accepting a nonconverged result merely because its linear constraints are satisfied.
+2. **Mock high-level policy.** Simulate asynchronously updated, noisy or abruptly changing Cartesian targets (including held targets and inference latency) and evaluate how the MPC filters these commands into feasible motions. Start with the simpler collision-free MPC.
+3. **Reproducible benchmarks.** Compare tracking accuracy, constraint violations, success rate, median/P95 computation time and projection overhead over multiple disturbance seeds. Distinguish offline-simulation throughput from demonstrated real-time performance.
+4. **Portfolio presentation.** Simplify example scripts, polish plots, document modeling assumptions and numerical limitations, and provide a concise demo video and reproducible command lines.
 
-### Solver improvements
-
-The current Cartesian solver uses constrained Gauss-Newton steps with fixed damping and backtracking line search.
-
-The next objectives are:
-
-- adaptive Levenberg-Marquardt damping;
-- more robust convergence criteria;
-- clearer solver termination statuses;
-- warm starts and more efficient repeated QP solves.
-
-### Solver validation
-
-The custom Gauss-Newton / SQP solver will be compared against IPOPT on the same nonlinear B-spline trajectory optimization problem.
-
-The comparison will include:
-
-- final objective value;
-- Cartesian tracking accuracy;
-- constraint satisfaction;
-- trajectory smoothness;
-- convergence behavior;
-- computation time.
-
-IPOPT will be used as an offline numerical reference rather than as a replacement for the custom solver.
-
-### Nonlinear constraints
-
-Once the solver is sufficiently robust, the formulation will be extended beyond the current linear B-spline joint constraints.
-
-The first planned extension is **collision avoidance** through nonlinear distance constraints.
-
-This naturally extends the current constrained Gauss-Newton formulation toward a more general **Sequential Quadratic Programming (SQP)** framework.
-
-Longer-term extensions include:
-
-- Cartesian task constraints;
-- receding-horizon / online trajectory optimization;
-- dual-arm coordination;
+Potential later extensions include continuous collision validation, moving obstacles, higher-rate MPC, ROS 2 or LeRobot integration, and dual-arm coordination. These are not required for the initial portfolio release.
