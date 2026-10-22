@@ -2,7 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from splineopt.bspline import BSpline
-from splineopt.optimizer import JointTrajectoryOptimizer
+from splineopt.joint_optimizer import JointTrajectoryOptimizer
 
 
 # ============================================================

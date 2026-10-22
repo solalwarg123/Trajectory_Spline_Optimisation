@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 
 from splineopt.bspline import BSpline
-from splineopt.optimizer import JointTrajectoryOptimizer
+from splineopt.joint_optimizer import JointTrajectoryOptimizer
 
 
 # ============================================================

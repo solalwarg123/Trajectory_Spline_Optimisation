@@ -2,11 +2,11 @@ import numpy as np
 import scipy.sparse as sp
 import osqp
 from dataclasses import dataclass, field
-from splineopt.constraints import build_joint_constraints
 
 
 @dataclass
 class CartesianIteration:
+    """Diagnostics recorded after an accepted Gauss-Newton step."""
     iteration: int
     objective: float
 
@@ -25,6 +25,7 @@ class CartesianIteration:
 
 @dataclass
 class CartesianOptimizationResult:
+    """Final trajectory, solver status and accepted-step history."""
     control_points: np.ndarray
     success: bool
     status: str
@@ -32,447 +33,35 @@ class CartesianOptimizationResult:
     history: list = field(default_factory=list)
 
 
-def _trapezoidal_weights(times):
-    """
-    Trapezoidal quadrature weights such that
-
-        sum_k w_k f(t_k)
-
-    approximates
-
-        integral f(t) dt.
-    """
-
-    times = np.asarray(
-        times,
-        dtype=float,
-    ).reshape(-1)
-
-    if times.size == 0:
-        raise ValueError("times cannot be empty.")
-
-    if times.size == 1:
-        return np.ones(1)
-
-    dt = np.diff(times)
-
-    if np.any(dt <= 0.0):
-        raise ValueError(
-            "times must be strictly increasing."
-        )
-
-    weights = np.empty_like(times)
-
-    weights[0] = 0.5 * dt[0]
-    weights[-1] = 0.5 * dt[-1]
-
-    if times.size > 2:
-        weights[1:-1] = 0.5 * (
-            times[2:] - times[:-2]
-        )
-
-    return weights
-
-
-class JointTrajectoryOptimizer:
-    """
-    Joint-space B-spline trajectory optimizer.
-
-    Solve the quadratic program
-
-        minimize
-            ||A_track c - b_track||^2
-            + lambda_smooth * c.T @ R2 @ c
-
-        subject to
-            q(t0)    = q0
-            qdot(t0) = v0
-
-            q_min <= c    <= q_max
-            v_min <= D1 c <= v_max
-            a_min <= D2 c <= a_max
-
-    Optionally:
-
-            qddot(t0) = a0
-
-    The QP is written in the OSQP form
-
-        minimize
-            1/2 c.T @ P @ c + g.T @ c
-
-        subject to
-            l <= A @ c <= u
-    """
-
-    def __init__(
-        self,
-        spline,
-        lambda_smooth=1.0,
-    ):
-        self.spline = spline
-        self.lambda_smooth = float(lambda_smooth)
-
-        if self.lambda_smooth < 0:
-            raise ValueError(
-                "lambda_smooth must be non-negative."
-            )
-
-    # ========================================================
-    # QP construction
-    # ========================================================
-
-    def build_constraints(
-        self,
-        q0,
-        v0,
-        q_min,
-        q_max,
-        v_min,
-        v_max,
-        a_min,
-        a_max,
-        a0=None,
-        vf=None,
-    ):
-        return build_joint_constraints(
-            spline=self.spline,
-            q0=q0,
-            v0=v0,
-            q_min=q_min,
-            q_max=q_max,
-            v_min=v_min,
-            v_max=v_max,
-            a_min=a_min,
-            a_max=a_max,
-            a0=a0,
-            vf=vf,
-        )
-
-    def build_qp(
-        self,
-        tracking_times,
-        q_ref,
-        q0,
-        v0,
-        q_min,
-        q_max,
-        v_min,
-        v_max,
-        a_min,
-        a_max,
-        a0=None,
-        vf=None,
-    ):
-        """
-        Build the QP matrices
-
-            P, g, A, l, u
-
-        for OSQP.
-
-        Parameters
-        ----------
-        tracking_times :
-            Times at which the optimized trajectory is compared
-            with the nominal trajectory.
-
-        q_ref :
-            Reference joint positions at tracking_times.
-            Shape:
-
-                (n_tracking_times, n_dof)
-
-        q0 :
-            Initial joint position.
-
-        v0 :
-            Initial joint velocity.
-
-        q_min, q_max :
-            Joint position limits.
-
-        v_min, v_max :
-            Joint velocity limits.
-
-        a_min, a_max :
-            Joint acceleration limits.
-
-        a0 :
-            Optional initial joint acceleration.
-        """
-
-        spline = self.spline
-
-        n_dof = spline.n_dof
-        n_control_points = spline.n_control_points
-
-        n_variables = (
-            n_control_points
-            * n_dof
-        )
-
-        # ====================================================
-        # Inputs
-        # ====================================================
-
-        tracking_times = np.asarray(
-            tracking_times,
-            dtype=float,
-        ).reshape(-1)
-
-        q_ref = np.asarray(
-            q_ref,
-            dtype=float,
-        )
-
-        n_tracking_times = len(
-            tracking_times
-        )
-
-        if q_ref.shape != (
-            n_tracking_times,
-            n_dof,
-        ):
-            raise ValueError(
-                "q_ref must have shape "
-                f"({n_tracking_times}, {n_dof}), "
-                f"got {q_ref.shape}."
-            )
-
-        if n_tracking_times == 0:
-            raise ValueError(
-                "tracking_times cannot be empty."
-            )
-
-        if np.any(
-            tracking_times < spline.t_start
-        ) or np.any(
-            tracking_times > spline.t_end
-        ):
-            raise ValueError(
-                "All tracking_times must lie inside "
-                "the spline domain."
-            )
-
-        # ====================================================
-        # Tracking matrix
-        #
-        # J_track =
-        #
-        #     ||A_track c - b_track||^2
-        #
-        # ====================================================
-
-        A_track = np.vstack([
-            spline.evaluation_matrix(
-                t,
-                derivative_order=0,
-            )
-            for t in tracking_times
-        ])
-
-        b_track = q_ref.reshape(-1)
-
-        # ====================================================
-        # Smoothness matrix
-        #
-        # J_smooth = c.T R2 c
-        #
-        # ====================================================
-
-        R2 = spline.smoothness_matrix(
-            derivative_order=2
-        )
-
-        # ====================================================
-        # Quadratic objective
-        #
-        # J =
-        #   ||A_track c - b_track||^2
-        #   + lambda c.T R2 c
-        #
-        # OSQP expects:
-        #
-        #   1/2 c.T P c + g.T c
-        #
-        # Therefore:
-        #
-        #   P =
-        #       2 (
-        #           A_track.T A_track
-        #           + lambda R2
-        #         )
-        #
-        #   g =
-        #       -2 A_track.T b_track
-        #
-        # ====================================================
-
-        P_dense = 2.0 * (
-            A_track.T @ A_track
-            + self.lambda_smooth * R2
-        )
-
-        # Avoid small numerical asymmetries
-        P_dense = 0.5 * (
-            P_dense
-            + P_dense.T
-        )
-
-        g = (
-            -2.0
-            * A_track.T
-            @ b_track
-        )
-
-        # OSQP only needs the upper triangular part of P
-        P = sp.triu(
-            sp.csc_matrix(P_dense),
-            format="csc",
-        )
-
-        A, l, u = self.build_constraints(
-            q0=q0,
-            v0=v0,
-            q_min=q_min,
-            q_max=q_max,
-            v_min=v_min,
-            v_max=v_max,
-            a_min=a_min,
-            a_max=a_max,
-            a0=a0,
-            vf=vf
-        )
-
-        return P, g, A, l, u
-
-    # ========================================================
-    # Solve
-    # ========================================================
-
-    def solve(
-        self,
-        tracking_times,
-        q_ref,
-        q0,
-        v0,
-        q_min,
-        q_max,
-        v_min,
-        v_max,
-        a_min,
-        a_max,
-        a0=None,
-        verbose=False,
-        vf=None,
-    ):
-        """
-        Build and solve the joint-space trajectory QP.
-
-        Returns
-        -------
-        control_points :
-            Optimal control points with shape
-
-                (n_control_points, n_dof)
-
-        result :
-            Complete OSQP result object.
-        """
-
-        P, g, A, l, u = self.build_qp(
-            tracking_times=tracking_times,
-            q_ref=q_ref,
-            q0=q0,
-            v0=v0,
-            q_min=q_min,
-            q_max=q_max,
-            v_min=v_min,
-            v_max=v_max,
-            a_min=a_min,
-            a_max=a_max,
-            a0=a0,
-            vf=vf
-        )
-
-        solver = osqp.OSQP()
-
-        solver.setup(
-            P=P,
-            q=g,
-            A=A,
-            l=l,
-            u=u,
-            verbose=verbose,
-            polishing=True,
-            eps_abs=1e-7,
-            eps_rel=1e-7,
-            max_iter=20000,
-        )
-
-        result = solver.solve()
-
-        if not result.info.status.lower().startswith(
-            "solved"
-        ):
-            raise RuntimeError(
-                "OSQP failed with status: "
-                f"{result.info.status}"
-            )
-
-        control_points = result.x.reshape(
-            self.spline.n_control_points,
-            self.spline.n_dof,
-        )
-
-        return control_points, result
-
-    # ========================================================
-    # Utilities
-    # ========================================================
-
-    def _dof_vector(
-        self,
-        value,
-        name,
-    ):
-        """
-        Convert an input to a vector of shape (n_dof,).
-        """
-
-        value = np.asarray(
-            value,
-            dtype=float,
-        ).reshape(-1)
-
-        if value.size != self.spline.n_dof:
-            raise ValueError(
-                f"{name} must contain "
-                f"{self.spline.n_dof} values, "
-                f"got {value.size}."
-            )
-
-        return value
-
-
 class GaussNewtonSolver:
-    """Constrained Gauss-Newton solver.
+    """
+    Constrained Gauss-Newton solver for Cartesian trajectory optimization.
 
-    This class knows how to solve a trajectory optimization
-    problem but does not define the trajectory problem itself.
+    The solver minimizes a nonlinear least-squares trajectory objective
+    subject to joint-space constraints, using successive quadratic
+    approximations solved with OSQP.
 
-    The problem provides:
-        - residuals and Jacobians,
-        - the nonlinear objective,
-        - linear constraints,
-        - error metrics.
+    At each iteration:
+        1. Linearize the Cartesian tracking residuals.
+        2. Build a regularized Gauss-Newton quadratic program.
+        3. Solve the QP subject to trajectory constraints.
+        4. Perform a backtracking line search.
+        5. Update the damping parameter when adaptive mode is enabled.
+        6. Check convergence and record iteration diagnostics.
 
-    The solver provides:
-        - Gauss-Newton quadratic models,
-        - OSQP solves,
-        - backtracking line search,
-        - convergence logic.
+    Two damping modes are supported:
+        - static: Fixed Levenberg-Marquardt regularization.
+        - adaptive: Adjust regularization using the gain ratio rho,
+        with optional QP retries after rejected line searches.
+
+    Collision handling is optional:
+        - Without collisions, the QP uses control points only.
+        - With collisions, non-negative slack variables are introduced
+        for linearized collision constraints, and the line search
+        uses a collision-aware merit function.
+
+    The solver is independent of the robot model and trajectory
+    representation. These are provided through the problem interface.
     """
 
     def __init__(
@@ -495,67 +84,35 @@ class GaussNewtonSolver:
         collision_slack_weight=1e4,
         collision_merit_weight=1e4,
     ):
-        self.damping = float(
-            damping
-        )
+        self.damping = float(damping)
 
-        self.damping_mode = str(
-            damping_mode
-        )
+        self.damping_mode = str(damping_mode)
 
-        self.damping_increase = float(
-            damping_increase
-        )
+        self.damping_increase = float(damping_increase)
 
-        self.damping_decrease = float(
-            damping_decrease
-        )
+        self.damping_decrease = float(damping_decrease)
 
-        self.rho_low = float(
-            rho_low
-        )
+        self.rho_low = float(rho_low)
 
-        self.rho_high = float(
-            rho_high
-        )
+        self.rho_high = float(rho_high)
 
-        self.min_damping = float(
-            min_damping
-        )
+        self.min_damping = float(min_damping)
 
-        self.max_damping = float(
-            max_damping
-        )
+        self.max_damping = float(max_damping)
 
-        self.max_damping_retries = int(
-            max_damping_retries
-        )
+        self.max_damping_retries = int(max_damping_retries)
 
-        self.max_iterations = int(
-            max_iterations
-        )
+        self.max_iterations = int(max_iterations)
 
-        self.step_tolerance = float(
-            step_tolerance
-        )
+        self.step_tolerance = float(step_tolerance)
 
-        self.cost_tolerance = float(
-            cost_tolerance
-        )
+        self.cost_tolerance = float(cost_tolerance)
 
-        self.line_search_shrink = float(
-            line_search_shrink
-        )
+        self.line_search_shrink = float(line_search_shrink)
 
-        self.min_alpha = float(
-            min_alpha
-        )
-        self.collision_slack_weight = float(
-            collision_slack_weight
-        )
-        self.collision_merit_weight = float(
-            collision_merit_weight
-        )
+        self.min_alpha = float(min_alpha)
+        self.collision_slack_weight = float(collision_slack_weight)
+        self.collision_merit_weight = float(collision_merit_weight)
 
         self._validate_parameters()
 
@@ -564,96 +121,69 @@ class GaussNewtonSolver:
     # =========================================================
 
     def _validate_parameters(self):
+        """Validate solver settings and damping configuration."""
 
-        if self.damping < 0.0:
-            raise ValueError(
-                "damping must be non-negative."
-            )
+        nonnegative = (
+            "damping",
+            "step_tolerance",
+            "cost_tolerance",
+        )
+        positive = (
+            "min_damping",
+            "max_damping",
+            "collision_slack_weight",
+            "collision_merit_weight",
+        )
+        greater_than_one = (
+            "damping_increase",
+            "damping_decrease",
+        )
 
-        if self.damping_mode not in {
-            "static",
-            "adaptive",
-        }:
-            raise ValueError(
-                "damping_mode must be "
-                "'static' or 'adaptive'."
-            )
+        for name in nonnegative:
+            value = getattr(self, name)
+            if not np.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and non-negative.")
 
-        if self.damping_increase <= 1.0:
-            raise ValueError(
-                "damping_increase must be > 1."
-            )
+        for name in positive:
+            value = getattr(self, name)
+            if not np.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and positive.")
 
-        if self.damping_decrease <= 1.0:
-            raise ValueError(
-                "damping_decrease must be > 1."
-            )
+        for name in greater_than_one:
+            value = getattr(self, name)
+            if not np.isfinite(value) or value <= 1.0:
+                raise ValueError(f"{name} must be finite and > 1.")
 
-        if not (
-            0.0
-            <= self.rho_low
-            < self.rho_high
+        if self.damping_mode not in ("static", "adaptive"):
+            raise ValueError("damping_mode must be 'static' or 'adaptive'.")
+
+        if (
+            not np.isfinite(self.rho_low)
+            or not np.isfinite(self.rho_high)
+            or not (0.0 <= self.rho_low < self.rho_high)
         ):
             raise ValueError(
-                "rho thresholds must satisfy "
-                "0 <= rho_low < rho_high."
-            )
-
-        if self.min_damping <= 0.0:
-            raise ValueError(
-                "min_damping must be positive."
+                "rho thresholds must satisfy 0 <= rho_low < rho_high "
+                "and must be finite."
             )
 
         if self.max_damping < self.min_damping:
-            raise ValueError(
-                "max_damping must be >= min_damping."
-            )
+            raise ValueError("max_damping must be >= min_damping.")
 
         if self.max_damping_retries < 0:
-            raise ValueError(
-                "max_damping_retries must be non-negative."
-            )
+            raise ValueError("max_damping_retries must be non-negative.")
 
         if self.max_iterations <= 0:
-            raise ValueError(
-                "max_iterations must be positive."
-            )
+            raise ValueError("max_iterations must be positive.")
 
-        if self.step_tolerance < 0.0:
-            raise ValueError(
-                "step_tolerance must be non-negative."
-            )
-
-        if self.cost_tolerance < 0.0:
-            raise ValueError(
-                "cost_tolerance must be non-negative."
-            )
-
-        if not (
-            0.0
-            < self.line_search_shrink
-            < 1.0
+        if (
+            not np.isfinite(self.line_search_shrink)
+            or not 0.0 < self.line_search_shrink < 1.0
         ):
-            raise ValueError(
-                "line_search_shrink must be in (0, 1)."
-            )
+            raise ValueError("line_search_shrink must be in (0, 1).")
 
-        if not (
-            0.0
-            < self.min_alpha
-            <= 1.0
-        ):
-            raise ValueError(
-                "min_alpha must be in (0, 1]."
-            )
-        if self.collision_slack_weight <= 0.0:
-            raise ValueError(
-                "collision_slack_weight must be positive."
-            )
-        if self.collision_merit_weight <= 0.0:
-            raise ValueError(
-                "collision_merit_weight must be positive."
-            )
+        if not np.isfinite(self.min_alpha) or not 0.0 < self.min_alpha <= 1.0:
+            raise ValueError("min_alpha must be in (0, 1].")
 
     # =========================================================
     # Gauss-Newton QP
@@ -675,81 +205,42 @@ class GaussNewtonSolver:
             None,
         )
 
-        if (
-            collision is None
-            or not collision.has_constraints
-        ):
+        if collision is None or not collision.has_constraints:
             return None
 
         return collision
 
-    def _merit_value(
-        self,
-        problem,
-        control_points,
-    ):
+    def _merit_value(self, problem, control_points, *, objective=None):
         """
-        Merit function used by the line search.
+        Evaluate the merit function used by the backtracking line search.
 
-        Without collisions:
-
-            Phi(c) = J(c)
-
-        exactly as before.
+        Without collisions, Phi(c) = F(c).
 
         With collisions:
 
-            Phi(c)
-            =
-            J(c)
-            +
-            lambda_merit
-            * sum(max(0, d_safe - d_i(c))^2)
+            Phi(c) = F(c) + w_merit * sum(max(0, d_safe - d_i(c))**2)
+
+        An already computed objective can be supplied to avoid
+        redundant trajectory evaluations.
         """
+        if objective is None:
+            objective = float(problem.objective(control_points))
 
-        objective = float(
-            problem.objective(
-                control_points
-            )
-        )
-
-        collision = (
-            self._collision_constraints(
-                problem
-            )
-        )
-
-        # -----------------------------------------------------
-        # Historical behaviour:
-        #
-        # no collision constraint -> merit == objective.
-        # -----------------------------------------------------
+        collision = self._collision_constraints(problem)
 
         if collision is None:
             return objective
 
-        distances = (
-            collision.distances(
-                control_points
-            )
-            .reshape(-1)
-        )
-
+        distances = collision.distances(control_points).reshape(-1)
         violations = np.maximum(
             0.0,
-            collision.safety_distance
-            - distances,
+            collision.safety_distance - distances,
         )
 
-        violation_cost = float(
-            violations
-            @ violations
-        )
+        violation_cost = float(violations @ violations)
 
         return float(
-            objective
-            + self.collision_merit_weight
-            * violation_cost
+            objective + self.collision_merit_weight * violation_cost
         )
 
     def _collision_feasible(
@@ -768,11 +259,7 @@ class GaussNewtonSolver:
         positive collision slacks.
         """
 
-        collision = (
-            self._collision_constraints(
-                problem
-            )
-        )
+        collision = self._collision_constraints(problem)
 
         if collision is None:
             return True
@@ -791,12 +278,53 @@ class GaussNewtonSolver:
         *,
         damping=None,
     ):
-        """Build one constrained Gauss-Newton QP.
+        """
+        Build the constrained Gauss-Newton quadratic subproblem.
 
-        The damped model is used to compute the step.
+        At the current control points c_i, linearize the residual:
 
-        The undamped Gauss-Newton model is returned separately
-        and is used to evaluate the gain ratio rho.
+            r(c) ≈ r_i + J_i @ (c - c_i)
+                = J_i @ c + d
+
+        where:
+
+            d = r_i - J_i @ c_i
+
+        Including acceleration regularization gives the undamped model:
+
+            H = J_i.T @ J_i + lambda_smooth * R2
+            P_model = 2 * H
+            g_model = 2 * J_i.T @ d
+
+        Levenberg-Marquardt damping adds:
+
+            damping * ||c - c_i||²
+
+        giving the QP coefficients:
+
+            P_qp = P_model + 2 * damping * I
+            g_qp = g_model - 2 * damping * c_i
+
+        Two constraint formulations are supported:
+            - Without collisions: a QP directly in control points c.
+            - With collisions: an augmented QP in z = [c, s], where
+            s >= 0 are penalized collision slack variables.
+
+        The undamped model is retained to compute the gain ratio rho,
+        independently of the regularization used to generate the step.
+
+        Args:
+            problem: Trajectory optimization problem.
+            current_control_points: Current flattened B-spline coefficients.
+            damping: Optional damping override.
+
+        Returns:
+            P_osqp, g_qp, A, l, u:
+                Quadratic program in OSQP form, possibly augmented
+                with collision slack variables.
+            P_model, g_model:
+                Undamped Gauss-Newton model coefficients in control-point
+                coordinates, used to calculate rho.
         """
 
         c_i = np.asarray(
@@ -809,18 +337,14 @@ class GaussNewtonSolver:
 
         damping = float(damping)
 
-        if damping < 0.0:
-            raise ValueError(
-                "damping must be non-negative."
-            )
+        if not np.isfinite(damping) or damping < 0.0:
+            raise ValueError("damping must be non-negative.")
 
         # ---------------------------------------------------------
         # Residual and Jacobian at current point
         # ---------------------------------------------------------
 
-        r, J = problem.residual_and_jacobian(
-            c_i
-        )
+        r, J = problem.residual_and_jacobian(c_i)
 
         # Linearized residual:
         #
@@ -835,22 +359,13 @@ class GaussNewtonSolver:
         # Used only to evaluate rho.
         # =========================================================
 
-        H_model = (
-            J.T @ J
-            + problem.lambda_smooth
-            * problem.R2
-        )
+        H_model = J.T @ J + problem.lambda_smooth * problem.R2
 
         P_model = 2.0 * H_model
 
-        P_model = 0.5 * (
-            P_model
-            + P_model.T
-        )
+        P_model = 0.5 * (P_model + P_model.T)
 
-        g_model = 2.0 * (
-            J.T @ d
-        )
+        g_model = 2.0 * (J.T @ d)
 
         # =========================================================
         # Damped QP
@@ -858,23 +373,13 @@ class GaussNewtonSolver:
         # Used by OSQP to compute the step.
         # =========================================================
 
-        H_qp = (
-            H_model
-            + damping
-            * np.eye(c_i.size)
-        )
+        H_qp = H_model + damping * np.eye(c_i.size)
 
         P_qp = 2.0 * H_qp
 
-        P_qp = 0.5 * (
-            P_qp
-            + P_qp.T
-        )
+        P_qp = 0.5 * (P_qp + P_qp.T)
 
-        g_qp = 2.0 * (
-            J.T @ d
-            - damping * c_i
-        )
+        g_qp = 2.0 * (J.T @ d - damping * c_i)
 
         # OSQP only needs upper triangular P.
         P_osqp = sp.triu(
@@ -903,11 +408,7 @@ class GaussNewtonSolver:
         #
         # =========================================================
 
-        collision = (
-            self._collision_constraints(
-                problem
-            )
-        )
+        collision = self._collision_constraints(problem)
 
         # =========================================================
         # Historical path: NO COLLISIONS
@@ -919,16 +420,10 @@ class GaussNewtonSolver:
                 problem,
                 "linearized_constraints",
             ):
-                A, l, u = (
-                    problem.linearized_constraints(
-                        c_i
-                    )
-                )
+                A, l, u = problem.linearized_constraints(c_i)
 
             else:
-                A, l, u = (
-                    problem.linear_constraints()
-                )
+                A, l, u = problem.linear_constraints()
 
             return (
                 P_osqp,
@@ -943,13 +438,9 @@ class GaussNewtonSolver:
         # Collision-aware path
         # =========================================================
 
-        A_static, l_static, u_static = (
-            problem.linear_constraints()
-        )
+        A_static, l_static, u_static = problem.linear_constraints()
 
-        A_static = sp.csc_matrix(
-            A_static
-        )
+        A_static = sp.csc_matrix(A_static)
 
         l_static = np.asarray(
             l_static,
@@ -961,28 +452,18 @@ class GaussNewtonSolver:
             dtype=float,
         ).reshape(-1)
 
-        H_col, h_col = (
-            collision.linearize(
-                c_i
-            )
-        )
+        H_col, h_col = collision.linearize(c_i)
 
-        H_col = sp.csc_matrix(
-            H_col
-        )
+        H_col = sp.csc_matrix(H_col)
 
         h_col = np.asarray(
             h_col,
             dtype=float,
         ).reshape(-1)
 
-        n_control_variables = (
-            c_i.size
-        )
+        n_control_variables = c_i.size
 
-        n_slacks = (
-            h_col.size
-        )
+        n_slacks = h_col.size
 
         # Defensive fallback.
         #
@@ -1179,14 +660,7 @@ class GaussNewtonSolver:
             dtype=float,
         ).reshape(-1)
 
-        return float(
-            0.5
-            * c
-            @ P
-            @ c
-            + g
-            @ c
-        )
+        return float(0.5 * c @ P @ c + g @ c)
 
     def _gain_ratio(
         self,
@@ -1217,43 +691,27 @@ class GaussNewtonSolver:
             dtype=float,
         ).reshape(-1)
 
-        current_cost = float(
-            problem.objective(
-                c
-            )
-        )
+        current_cost = float(problem.objective(c))
 
-        candidate_cost = float(
-            problem.objective(
-                candidate
-            )
-        )
+        candidate_cost = float(problem.objective(candidate))
 
-        actual_reduction = (
-            current_cost
-            - candidate_cost
-        )
+        actual_reduction = current_cost - candidate_cost
 
-        predicted_reduction = (
-            self._qp_model_value(
-                P,
-                g,
-                c,
-            )
-            - self._qp_model_value(
-                P,
-                g,
-                candidate,
-            )
+        predicted_reduction = self._qp_model_value(
+            P,
+            g,
+            c,
+        ) - self._qp_model_value(
+            P,
+            g,
+            candidate,
         )
 
         if predicted_reduction <= 0.0:
             return -np.inf
 
-        return float(
-            actual_reduction
-            / predicted_reduction
-        )
+        return float(actual_reduction / predicted_reduction)
+
     # =========================================================
     # One Gauss-Newton / SQP step
     # =========================================================
@@ -1296,9 +754,7 @@ class GaussNewtonSolver:
             g_model,
         ) = self.build_gauss_newton_qp(
             problem=problem,
-            current_control_points=(
-                c_current
-            ),
+            current_control_points=(c_current),
             damping=damping,
         )
 
@@ -1316,54 +772,61 @@ class GaussNewtonSolver:
 
         result = solver.solve()
 
-        if not (
-            result.info.status
-            .lower()
-            .startswith("solved")
-        ):
+        if not (result.info.status.lower().startswith("solved")):
             raise RuntimeError(
-                "Gauss-Newton QP failed: "
-                f"{result.info.status}"
-            )
+                "Gauss-Newton QP failed: " f"{result.info.status}")
 
         solution = np.asarray(
             result.x,
             dtype=float,
         ).reshape(-1)
 
-        n_control_variables = (
-            c_current.size
-        )
+        n_control_variables = c_current.size
 
-        if (
-            solution.size
-            < n_control_variables
-        ):
+        if solution.size < n_control_variables:
             raise RuntimeError(
-                "OSQP returned fewer variables "
-                "than expected."
-            )
+                "OSQP returned fewer variables " "than expected.")
 
         # -----------------------------------------------------
         # The first variables are always the B-spline control
         # points. Any remaining variables are collision slacks.
         # -----------------------------------------------------
 
-        c_qp = solution[
-            :n_control_variables
-        ]
+        c_qp = solution[:n_control_variables]
 
-        self._last_collision_slacks = (
-            solution[
-                n_control_variables:
-            ].copy()
-        )
+        self._last_collision_slacks = solution[n_control_variables:].copy()
 
         return (
             c_qp,
             result,
             P_model,
             g_model,
+        )
+
+    # =========================================================
+    # Result construction
+    # =========================================================
+
+    @staticmethod
+    def _make_result(
+        problem,
+        control_points,
+        *,
+        success,
+        status,
+        iterations,
+        history,
+    ):
+        """Build an optimization result from flattened control points."""
+        return CartesianOptimizationResult(
+            control_points=np.asarray(control_points).reshape(
+                problem.spline.n_control_points,
+                problem.spline.n_dof,
+            ),
+            success=success,
+            status=status,
+            iterations=iterations,
+            history=history,
         )
 
     # =========================================================
@@ -1378,26 +841,38 @@ class GaussNewtonSolver:
         verbose=False,
     ):
         """
-        Solve the nonlinear trajectory optimization problem.
+        Solve the nonlinear constrained trajectory optimization problem.
 
-        Without active collision constraints, the solver follows the
-        historical Gauss-Newton behaviour:
+        Successive Gauss-Newton QPs are solved using OSQP. Each candidate
+        step is accepted through backtracking line search.
 
-            - QP in the B-spline control points c,
-            - objective-based line search,
-            - objective-based convergence.
+        Without collisions, acceptance is based on the true nonlinear
+        objective. With collisions, a merit function additionally penalizes
+        violations of nonlinear collision constraints.
 
-        With active collision constraints:
+        In adaptive damping mode, a rejected line search may trigger
+        another QP with increased damping. Accepted steps update the
+        damping based on the gain ratio rho.
 
-            - collision slacks are introduced inside the QP,
-            - the line search uses a collision-aware merit function,
-            - convergence is accepted only if collision constraints
-              are satisfied.
+        Termination occurs upon:
+            - A sufficiently small step.
+            - A sufficiently small relative merit decrease.
+            - The maximum number of iterations.
+
+        Collision feasibility is additionally required before reporting
+        successful convergence when collision constraints are enabled.
+
+        Args:
+            problem: Cartesian trajectory optimization problem.
+            initial_control_points: Initial B-spline control points.
+            verbose: Print iteration diagnostics when True.
+
+        Returns:
+            CartesianOptimizationResult containing the final trajectory,
+            convergence status, iteration count, and optimization history.
         """
 
-        # =========================================================
-        # Initial state
-        # =========================================================
+        # Initialize optimization state
 
         c = np.asarray(
             initial_control_points,
@@ -1406,18 +881,9 @@ class GaussNewtonSolver:
 
         history = []
 
-        current_cost = float(
-            problem.objective(
-                c
-            )
-        )
+        current_cost = float(problem.objective(c))
 
-        # ---------------------------------------------------------
-        # Current damping value
-        #
-        # self.damping is the configured initial damping.
-        # mu is local to this solve and may evolve in adaptive mode.
-        # ---------------------------------------------------------
+        # Local damping may evolve without modifying self.damping.
 
         mu = float(
             np.clip(
@@ -1427,37 +893,21 @@ class GaussNewtonSolver:
             )
         )
 
-        # =========================================================
-        # Initial reporting
-        # =========================================================
+        # Report initial tracking and collision metrics
 
         if verbose:
 
-            metrics = (
-                problem.error_metrics(
-                    c
-                )
-            )
+            metrics = problem.error_metrics(c)
 
-            collision = (
-                self._collision_constraints(
-                    problem
-                )
-            )
+            collision = self._collision_constraints(problem)
 
             if collision is None:
 
-                min_collision_distance = (
-                    None
-                )
+                min_collision_distance = None
 
             else:
 
-                min_collision_distance = (
-                    collision.minimum_distance(
-                        c
-                    )
-                )
+                min_collision_distance = collision.minimum_distance(c)
 
             message = (
                 f"Initial: "
@@ -1472,47 +922,21 @@ class GaussNewtonSolver:
                 f"{np.degrees(metrics['orientation_max']):.3f} deg"
             )
 
-            if (
-                min_collision_distance
-                is not None
-            ):
+            if min_collision_distance is not None:
 
-                message += (
-                    f"  dmin="
-                    f"{1e3 * min_collision_distance:.2f} mm"
-                )
+                message += f"  dmin=" f"{1e3 * min_collision_distance:.2f} mm"
 
-            print(
-                message
-            )
+            print(message)
 
-        # =========================================================
-        # Main Gauss-Newton / SQP iterations
-        # =========================================================
+        # Main Gauss-Newton / SQP loop
 
-        for iteration in range(
-            self.max_iterations
-        ):
-
-            # -----------------------------------------------------
-            # Adaptive damping retries
-            #
-            # Static mode:
-            #     this loop is executed only once unless the step
-            #     succeeds.
-            #
-            # Adaptive mode:
-            #     if the line search rejects the local model,
-            #     damping is increased and the QP is rebuilt.
-            # -----------------------------------------------------
-
+        for iteration in range(self.max_iterations):
+            # Retry rejected steps with increased damping in adaptive mode.
             retry = 0
 
             while True:
 
-                # =================================================
-                # Local constrained Gauss-Newton / SQP model
-                # =================================================
+                # Solve the local constrained QP
 
                 (
                     c_qp,
@@ -1526,237 +950,115 @@ class GaussNewtonSolver:
                     verbose=False,
                 )
 
-                direction = (
-                    c_qp - c
-                )
+                direction = c_qp - c
 
-                full_step_norm = float(
-                    np.linalg.norm(
-                        direction
-                    )
-                )
+                full_step_norm = float(np.linalg.norm(direction))
 
-                # =================================================
-                # QP proposes essentially no movement
-                # =================================================
-                #
-                # Without collisions this is exactly the historical
-                # stopping criterion.
-                #
-                # With collisions we may only declare convergence if
-                # the true nonlinear collision constraints are also
-                # satisfied.
-                # =================================================
+                # A negligible QP step implies convergence only if collision-feasible.
 
-                if (
-                    full_step_norm
-                    <= (
-                        self.step_tolerance
-                        * (
-                            1.0
-                            + np.linalg.norm(
-                                c
-                            )
-                        )
-                    )
-                    and self._collision_feasible(
+                if full_step_norm <= self.step_tolerance * (
+                    1.0 + np.linalg.norm(c)
+                ) and self._collision_feasible(problem, c):
+
+                    return self._make_result(
                         problem,
                         c,
-                    )
-                ):
-
-                    return (
-                        CartesianOptimizationResult(
-                            control_points=(
-                                c.reshape(
-                                    problem.spline.n_control_points,
-                                    problem.spline.n_dof,
-                                )
-                            ),
-                            success=True,
-                            status="step_tolerance",
-                            iterations=iteration,
-                            history=history,
-                        )
+                        success=True,
+                        status="step_tolerance",
+                        iterations=iteration,
+                        history=history,
                     )
 
-                # =================================================
-                # Backtracking line search
-                # =================================================
-                #
-                # Without collisions:
-                #
-                #     merit(c) = objective(c)
-                #
-                # and this reduces exactly to the historical line
-                # search.
-                #
-                # With collisions:
-                #
-                #     merit(c)
-                #       = objective(c)
-                #       + lambda_merit * collision_violation(c)
-                #
-                # so an objective increase may temporarily be
-                # accepted if collision feasibility improves enough.
-                # =================================================
+                # Backtracking on objective (no collisions) or collision-aware merit.
 
                 alpha = 1.0
                 accepted = False
 
-                current_merit = (
-                    self._merit_value(
-                        problem,
-                        c,
-                    )
+                current_merit = self._merit_value(
+                    problem,
+                    c,
                 )
 
-                while (
-                    alpha
-                    >= self.min_alpha
-                ):
+                while alpha >= self.min_alpha:
 
-                    candidate = (
-                        c
-                        + alpha
-                        * direction
+                    candidate = c + alpha * direction
+
+                    candidate_cost = float(problem.objective(candidate))
+
+                    candidate_merit = self._merit_value(
+                        problem,
+                        candidate,
+                        objective=candidate_cost,
                     )
 
-                    candidate_cost = float(
-                        problem.objective(
-                            candidate
-                        )
-                    )
-
-                    candidate_merit = (
-                        self._merit_value(
-                            problem,
-                            candidate,
-                        )
-                    )
-
-                    if (
-                        candidate_merit
-                        < current_merit
-                    ):
+                    if candidate_merit < current_merit:
 
                         accepted = True
                         break
 
-                    alpha *= (
-                        self.line_search_shrink
-                    )
+                    alpha *= self.line_search_shrink
 
-                # =================================================
-                # Successful line search
-                # =================================================
+                # Evaluate model agreement using the undamped objective model.
 
                 if accepted:
 
-                    # -------------------------------------------------
-                    # rho remains based on the original Gauss-Newton
-                    # objective model.
-                    #
-                    # The merit function is only used to globalize the
-                    # collision-aware SQP iterations.
-                    # -------------------------------------------------
+                    # rho measures the quality of the undamped tracking model.
+                    # Collision penalties affect line-search acceptance, not rho.
 
                     rho = self._gain_ratio(
                         problem=problem,
                         current_control_points=c,
-                        candidate_control_points=(
-                            candidate
-                        ),
+                        candidate_control_points=(candidate),
                         P=P_model,
                         g=g_model,
                     )
 
                     break
 
-                # =================================================
-                # Line search failed
-                # =================================================
+                # Reject the step; static mode stops, adaptive mode retries.
 
-                # -------------------------------------------------
-                # Static mode:
-                #
-                # preserve the historical behaviour.
-                # -------------------------------------------------
+                if self.damping_mode == "static":
 
-                if (
-                    self.damping_mode
-                    == "static"
-                ):
-
-                    return (
-                        CartesianOptimizationResult(
-                            control_points=(
-                                c.reshape(
-                                    problem.spline.n_control_points,
-                                    problem.spline.n_dof,
-                                )
-                            ),
-                            success=False,
-                            status="line_search_failed",
-                            iterations=iteration,
-                            history=history,
-                        )
+                    return self._make_result(
+                        problem,
+                        c,
+                        success=False,
+                        status="line_search_failed",
+                        iterations=iteration,
+                        history=history,
                     )
 
-                # -------------------------------------------------
-                # Adaptive mode:
-                #
-                # increase damping and rebuild the local QP.
-                # -------------------------------------------------
+                # Increase damping and retry after a rejected line search.
 
-                if (
-                    retry
-                    >= self.max_damping_retries
-                ):
+                if retry >= self.max_damping_retries:
 
-                    return (
-                        CartesianOptimizationResult(
-                            control_points=(
-                                c.reshape(
-                                    problem.spline.n_control_points,
-                                    problem.spline.n_dof,
-                                )
-                            ),
-                            success=False,
-                            status="damping_limit",
-                            iterations=iteration,
-                            history=history,
-                        )
+                    return self._make_result(
+                        problem,
+                        c,
+                        success=False,
+                        status="damping_limit",
+                        iterations=iteration,
+                        history=history,
                     )
 
                 new_mu = float(
                     min(
-                        mu
-                        * self.damping_increase,
+                        mu * self.damping_increase,
                         self.max_damping,
                     )
                 )
 
                 # Cannot increase damping any further.
 
-                if (
-                    new_mu
-                    <= mu
-                ):
+                if new_mu <= mu:
 
-                    return (
-                        CartesianOptimizationResult(
-                            control_points=(
-                                c.reshape(
-                                    problem.spline.n_control_points,
-                                    problem.spline.n_dof,
-                                )
-                            ),
-                            success=False,
-                            status="damping_limit",
-                            iterations=iteration,
-                            history=history,
-                        )
+                    return self._make_result(
+                        problem,
+                        c,
+                        success=False,
+                        status="damping_limit",
+                        iterations=iteration,
+                        history=history,
                     )
 
                 retry += 1
@@ -1772,57 +1074,23 @@ class GaussNewtonSolver:
                         f"{self.max_damping_retries})"
                     )
 
-            # =====================================================
-            # A step has been accepted
-            # =====================================================
+            # The candidate has been accepted by the line search.
 
-            previous_cost = (
-                current_cost
-            )
+            previous_merit = current_merit
 
-            previous_merit = (
-                current_merit
-            )
+            step_norm = float(alpha * full_step_norm)
 
-            step_norm = float(
-                alpha
-                * full_step_norm
-            )
+            # Adjust damping from rho while respecting configured bounds.
 
-            # =====================================================
-            # Adaptive damping update
-            # =====================================================
-            #
-            # rho still measures agreement between the true tracking
-            # objective and the undamped Gauss-Newton model.
-            #
-            # Collision restoration is handled separately through
-            # the merit function.
-            # =====================================================
+            if self.damping_mode == "adaptive":
 
-            if (
-                self.damping_mode
-                == "adaptive"
-            ):
+                if rho < self.rho_low:
 
-                if (
-                    rho
-                    < self.rho_low
-                ):
+                    mu *= self.damping_increase
 
-                    mu *= (
-                        self.damping_increase
-                    )
+                elif rho > self.rho_high and alpha == 1.0:
 
-                elif (
-                    rho
-                    > self.rho_high
-                    and alpha == 1.0
-                ):
-
-                    mu /= (
-                        self.damping_decrease
-                    )
+                    mu /= self.damping_decrease
 
                 mu = float(
                     np.clip(
@@ -1832,98 +1100,48 @@ class GaussNewtonSolver:
                     )
                 )
 
-            # =====================================================
-            # Accept step
-            # =====================================================
+            # Commit the accepted trajectory and its objective values
 
             c = candidate
 
-            current_cost = (
-                candidate_cost
-            )
+            current_cost = candidate_cost
 
-            current_merit = (
-                candidate_merit
-            )
+            current_merit = candidate_merit
 
-            metrics = (
-                problem.error_metrics(
-                    c
-                )
-            )
+            metrics = problem.error_metrics(c)
 
-            # =====================================================
-            # Collision diagnostics
-            # =====================================================
+            # Collect minimum collision distance for logging
 
-            collision = (
-                self._collision_constraints(
-                    problem
-                )
-            )
+            collision = self._collision_constraints(problem)
 
             if collision is None:
 
-                min_collision_distance = (
-                    None
-                )
+                min_collision_distance = None
 
             else:
 
-                min_collision_distance = (
-                    collision.minimum_distance(
-                        c
-                    )
-                )
+                min_collision_distance = collision.minimum_distance(c)
 
-            # =====================================================
-            # Iteration history
-            # =====================================================
+            # Record diagnostics for the accepted step
 
             history.append(
                 CartesianIteration(
                     iteration=iteration,
                     objective=current_cost,
-
-                    position_rms=metrics[
-                        "position_rms"
-                    ],
-
-                    position_max=metrics[
-                        "position_max"
-                    ],
-
-                    orientation_rms=metrics[
-                        "orientation_rms"
-                    ],
-
-                    orientation_max=metrics[
-                        "orientation_max"
-                    ],
-
+                    position_rms=metrics["position_rms"],
+                    position_max=metrics["position_max"],
+                    orientation_rms=metrics["orientation_rms"],
+                    orientation_max=metrics["orientation_max"],
                     step_norm=step_norm,
                     alpha=alpha,
-
-                    osqp_status=(
-                        osqp_result.info.status
-                    ),
-
-                    osqp_solve_time=float(
-                        osqp_result.info.solve_time
-                    ),
+                    osqp_status=(osqp_result.info.status),
+                    osqp_solve_time=float(osqp_result.info.solve_time),
                 )
             )
 
-            # =====================================================
-            # Verbose output
-            # =====================================================
-
             if verbose:
 
-                if (
-                    self.damping_mode
-                    == "adaptive"
-                ):
+                if self.damping_mode == "adaptive":
 
                     message = (
                         f"[{iteration:02d}] "
@@ -1952,131 +1170,58 @@ class GaussNewtonSolver:
                         f"alpha={alpha:.3f}"
                     )
 
-                if (
-                    min_collision_distance
-                    is not None
-                ):
+                if min_collision_distance is not None:
 
-                    message += (
-                        f"  dmin="
-                        f"{1e3 * min_collision_distance:.2f} mm"
-                    )
+                    message += f"  dmin=" f"{1e3 * min_collision_distance:.2f} mm"
 
-                print(
-                    message
-                )
+                print(message)
 
-            # =====================================================
-            # Step convergence
-            # =====================================================
-            #
-            # With collision constraints, a small step is not enough:
-            # the true nonlinear collision constraints must also be
-            # satisfied.
-            # =====================================================
+            # Check step convergence and true collision feasibility
 
-            if (
-                step_norm
-                <= (
-                    self.step_tolerance
-                    * (
-                        1.0
-                        + np.linalg.norm(
-                            c
-                        )
-                    )
-                )
-                and self._collision_feasible(
-                    problem,
-                    c,
-                )
+            if step_norm <= (
+                self.step_tolerance * (1.0 + np.linalg.norm(c))
+            ) and self._collision_feasible(
+                problem,
+                c,
             ):
 
-                return (
-                    CartesianOptimizationResult(
-                        control_points=(
-                            c.reshape(
-                                problem.spline.n_control_points,
-                                problem.spline.n_dof,
-                            )
-                        ),
-                        success=True,
-                        status="step_tolerance",
-                        iterations=(
-                            iteration + 1
-                        ),
-                        history=history,
-                    )
+                return self._make_result(
+                    problem,
+                    c,
+                    success=True,
+                    status="step_tolerance",
+                    iterations=iteration + 1,
+                    history=history,
                 )
 
-            # =====================================================
-            # Merit convergence
-            # =====================================================
-            #
-            # Without collisions:
-            #
-            #     merit == objective
-            #
-            # so this is exactly the historical objective convergence
-            # criterion.
-            #
-            # With collisions we measure progress in the same merit
-            # function used by the line search.
-            # =====================================================
+            # Check relative decrease of the acceptance merit function
 
-            relative_decrease = (
-                previous_merit
-                - current_merit
-            ) / max(
-                abs(
-                    previous_merit
-                ),
+            relative_decrease = (previous_merit - current_merit) / max(
+                abs(previous_merit),
                 1e-12,
             )
 
-            if (
-                relative_decrease
-                <= self.cost_tolerance
-                and self._collision_feasible(
-                    problem,
-                    c,
-                )
+            if relative_decrease <= self.cost_tolerance and self._collision_feasible(
+                problem,
+                c,
             ):
 
-                return (
-                    CartesianOptimizationResult(
-                        control_points=(
-                            c.reshape(
-                                problem.spline.n_control_points,
-                                problem.spline.n_dof,
-                            )
-                        ),
-                        success=True,
-                        status="cost_tolerance",
-                        iterations=(
-                            iteration + 1
-                        ),
-                        history=history,
-                    )
+                return self._make_result(
+                    problem,
+                    c,
+                    success=True,
+                    status="cost_tolerance",
+                    iterations=iteration + 1,
+                    history=history,
                 )
 
-        # =========================================================
-        # Maximum number of iterations reached
-        # =========================================================
+        # Maximum iterations reached without convergence
 
-        return (
-            CartesianOptimizationResult(
-                control_points=(
-                    c.reshape(
-                        problem.spline.n_control_points,
-                        problem.spline.n_dof,
-                    )
-                ),
-                success=False,
-                status="max_iterations",
-                iterations=(
-                    self.max_iterations
-                ),
-                history=history,
-            )
+        return self._make_result(
+            problem,
+            c,
+            success=False,
+            status="max_iterations",
+            iterations=self.max_iterations,
+            history=history,
         )

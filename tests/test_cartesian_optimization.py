@@ -420,3 +420,29 @@ def test_gauss_newton_solver_returns_feasible_solution(
     assert np.all(
         values <= u + 1e-7
     )
+
+
+@pytest.mark.parametrize(
+    "parameter",
+    [
+        "orientation_scale",
+        "lambda_smooth",
+        "lambda_terminal",
+    ],
+)
+@pytest.mark.parametrize(
+    "invalid_value",
+    [np.nan, np.inf, -np.inf],
+)
+def test_invalid_cost_parameters_are_rejected(
+    kinova_case,
+    parameter,
+    invalid_value,
+):
+    """Non-finite cost parameters must be rejected."""
+
+    with pytest.raises(ValueError, match=parameter):
+        make_problem(
+            kinova_case,
+            **{parameter: invalid_value},
+        )

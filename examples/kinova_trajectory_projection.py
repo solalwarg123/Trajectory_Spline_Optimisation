@@ -8,7 +8,7 @@ import meshcat.geometry as mg
 from mpl_toolkits.mplot3d.art3d import Line3DCollection
 
 from splineopt.bspline import BSpline
-from splineopt.optimizer import JointTrajectoryOptimizer
+from splineopt.joint_optimizer import JointTrajectoryOptimizer
 from splineopt.robotics import Robot
 
 

@@ -1,7 +1,7 @@
 import numpy as np
 
 from splineopt.bspline import BSpline
-from splineopt.optimizer import JointTrajectoryOptimizer
+from splineopt.joint_optimizer import JointTrajectoryOptimizer
 
 
 def make_test_spline():

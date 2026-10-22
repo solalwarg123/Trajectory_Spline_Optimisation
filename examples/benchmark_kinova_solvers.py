@@ -10,9 +10,9 @@ from splineopt.cartesian_problem import (
 )
 
 from splineopt.optimizer import (
-    JointTrajectoryOptimizer,
     GaussNewtonSolver,
 )
+from splineopt.joint_optimizer import JointTrajectoryOptimizer
 
 from splineopt.ipopt_solver import (
     IpoptSolver,
