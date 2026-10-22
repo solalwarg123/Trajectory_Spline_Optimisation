@@ -1,6 +1,6 @@
 
 from types import SimpleNamespace
-
+import pytest
 import numpy as np
 
 from splineopt.mpc import CartesianMPC
@@ -362,3 +362,77 @@ def test_mpc_does_not_accept_infeasible_fallback():
         mpc.previous_control_points,
         initial,
     )
+
+
+@pytest.mark.parametrize("invalid_result", ["nan", "wrong_shape"])
+@pytest.mark.parametrize("fallback_collision_feasible", [True, False])
+def test_mpc_invalid_gn_result_with_collision_filtering(
+    invalid_result, fallback_collision_feasible
+):
+    """Invalid GN results must trigger a safe, feasible fallback."""
+
+    class FakeCollision:
+        has_constraints = True
+        environment = SimpleNamespace(n_obstacles=1)
+
+        def near_obstacle_indices(self, control_points, **kwargs):
+            return []
+
+        def is_feasible(self, control_points, tolerance=1e-4):
+            return fallback_collision_feasible
+
+    class CollisionProblem(ConstraintProblem):
+        def __init__(self):
+            super().__init__()
+            self.collision_constraints = FakeCollision()
+
+    # Simulate an invalid GN result.
+    if invalid_result == "nan":
+        invalid_c = np.full((4, 2), np.nan)
+    else:
+        invalid_c = np.zeros((3, 2))
+
+    initial = np.zeros((4, 2))
+    c_projected = np.full((4, 2), 0.15)
+
+    mpc = CartesianMPC(
+        CollisionProblem(),
+        FixedSolver(invalid_c, success=False),
+        initial,
+        collision_activation_distance=0.1,
+        project_warm_start=True,
+    )
+
+    # Isolate the fallback logic from the OSQP projection.
+    mpc._prepare_warm_start = (
+        lambda q0, v0: c_projected.copy()
+    )
+
+    result = mpc.step(
+        np.zeros(2),
+        np.zeros(2),
+        [],
+    )
+
+    assert mpc.last_solution_info["accepted"] == fallback_collision_feasible
+
+    if fallback_collision_feasible:
+        assert mpc.last_solution_info["fallback_used"]
+        assert mpc.last_solution_info["solution_source"] == "projected_warm_start"
+
+        np.testing.assert_allclose(
+            result.control_points,
+            c_projected,
+        )
+        np.testing.assert_allclose(
+            mpc.previous_control_points,
+            c_projected,
+        )
+    else:
+        assert not mpc.last_solution_info["fallback_used"]
+        assert mpc.last_solution_info["solution_source"] == "none"
+
+        np.testing.assert_allclose(
+            mpc.previous_control_points,
+            initial,
+        )

@@ -36,7 +36,6 @@ from time import perf_counter
 import numpy as np
 import scipy.sparse as sp
 
-
 try:
     import cyipopt
 except ImportError:
@@ -45,7 +44,20 @@ except ImportError:
 
 @dataclass
 class IpoptOptimizationResult:
-    """Result returned by IpoptSolver."""
+    """
+    Result and diagnostics of an IPOPT optimization.
+
+    Attributes:
+        control_points: Optimized control points, shape (Nc, n_dof).
+        success: True if IPOPT reports successful or acceptable convergence.
+        status: IPOPT termination status code.
+        status_message: Human-readable termination message.
+        objective: Final objective value.
+        iterations: Number of IPOPT iterations reported by the callback.
+        solve_time: Time spent in the IPOPT solve call, in seconds.
+        raw_info: Original information dictionary returned by CyIpopt.
+        objective_history: Objective values recorded during iterations.
+    """
 
     control_points: np.ndarray
 
@@ -58,9 +70,7 @@ class IpoptOptimizationResult:
     solve_time: float
 
     raw_info: dict
-    objective_history: list = field(
-        default_factory=list
-    )
+    objective_history: list = field(default_factory=list)
 
 
 class _CyIpoptAdapter:
@@ -80,10 +90,22 @@ class _CyIpoptAdapter:
     old/simple optimization problems remain supported.
     """
 
-    def __init__(
-        self,
-        problem,
-    ):
+    def __init__(self, problem,):
+        """
+        Initialize the IPOPT callback adapter.
+
+        The adapter retrieves linear and optional nonlinear constraints,
+        validates their bounds and dimensions, and constructs a fixed
+        Jacobian sparsity structure.
+
+        Linear constraints use the sparsity of A. Nonlinear constraints
+        currently use a dense Jacobian structure.
+
+        Args:
+            problem: Optimization problem implementing the required
+                objective, gradient and constraint interfaces.
+        """
+
         self.problem = problem
         self.objective_history = []
 
@@ -91,9 +113,7 @@ class _CyIpoptAdapter:
         # Linear constraints
         # =====================================================
 
-        A, l, u = (
-            problem.linear_constraints()
-        )
+        A, l, u = problem.linear_constraints()
 
         A = sp.coo_matrix(A)
         A.sum_duplicates()
@@ -110,29 +130,19 @@ class _CyIpoptAdapter:
             dtype=float,
         ).reshape(-1)
 
-        if self.A.shape[0] != (
-            self.linear_lower.size
-        ):
+        if self.A.shape[0] != (self.linear_lower.size):
             raise ValueError(
-                "Constraint matrix and lower bounds "
-                "have incompatible dimensions."
+                "Constraint matrix and lower bounds have incompatible dimensions."
             )
 
-        if self.A.shape[0] != (
-            self.linear_upper.size
-        ):
+        if self.A.shape[0] != (self.linear_upper.size):
             raise ValueError(
-                "Constraint matrix and upper bounds "
-                "have incompatible dimensions."
+                "Constraint matrix and upper bounds have incompatible dimensions."
             )
 
-        self.n_variables = (
-            self.A.shape[1]
-        )
+        self.n_variables = self.A.shape[1]
 
-        self.n_linear_constraints = (
-            self.A.shape[0]
-        )
+        self.n_linear_constraints = self.A.shape[0]
 
         # =====================================================
         # Optional nonlinear constraints
@@ -153,11 +163,13 @@ class _CyIpoptAdapter:
             "nonlinear_constraint_bounds",
         )
 
-        nonlinear_interface_count = sum([
-            has_values,
-            has_jacobian,
-            has_bounds,
-        ])
+        nonlinear_interface_count = sum(
+            [
+                has_values,
+                has_jacobian,
+                has_bounds,
+            ]
+        )
 
         if nonlinear_interface_count not in {
             0,
@@ -171,16 +183,11 @@ class _CyIpoptAdapter:
                 "nonlinear_constraint_bounds()."
             )
 
-        self.has_nonlinear_constraints = (
-            nonlinear_interface_count == 3
-        )
+        self.has_nonlinear_constraints = nonlinear_interface_count == 3
 
         if self.has_nonlinear_constraints:
 
-            nonlinear_lower, nonlinear_upper = (
-                problem
-                .nonlinear_constraint_bounds()
-            )
+            nonlinear_lower, nonlinear_upper = problem.nonlinear_constraint_bounds()
 
             self.nonlinear_lower = np.asarray(
                 nonlinear_lower,
@@ -204,56 +211,51 @@ class _CyIpoptAdapter:
                 dtype=float,
             )
 
-        if (
-            self.nonlinear_lower.size
-            != self.nonlinear_upper.size
-        ):
+        if self.nonlinear_lower.size != self.nonlinear_upper.size:
             raise ValueError(
-                "Nonlinear lower and upper bounds "
-                "have incompatible dimensions."
+                "Nonlinear lower and upper bounds " "have incompatible dimensions."
             )
 
-        self.n_nonlinear_constraints = (
-            self.nonlinear_lower.size
-        )
+        self.n_nonlinear_constraints = self.nonlinear_lower.size
 
         # =====================================================
         # Complete constraint bounds
         # =====================================================
 
-        self.constraint_lower = np.concatenate([
-            self.linear_lower,
-            self.nonlinear_lower,
-        ])
+        self.constraint_lower = np.concatenate(
+            [
+                self.linear_lower,
+                self.nonlinear_lower,
+            ]
+        )
 
-        self.constraint_upper = np.concatenate([
-            self.linear_upper,
-            self.nonlinear_upper,
-        ])
+        self.constraint_upper = np.concatenate(
+            [
+                self.linear_upper,
+                self.nonlinear_upper,
+            ]
+        )
+
+        if np.any(self.constraint_lower > self.constraint_upper):
+            raise ValueError("Constraint lower bounds exceed upper bounds.")
 
         # =====================================================
         # Linear Jacobian structure
         # =====================================================
 
-        self._linear_jacobian_rows = (
-            self.A.row.astype(
-                np.int32,
-                copy=False,
-            )
+        self._linear_jacobian_rows = self.A.row.astype(
+            np.int32,
+            copy=False,
         )
 
-        self._linear_jacobian_cols = (
-            self.A.col.astype(
-                np.int32,
-                copy=False,
-            )
+        self._linear_jacobian_cols = self.A.col.astype(
+            np.int32,
+            copy=False,
         )
 
-        self._linear_jacobian_values = (
-            self.A.data.astype(
-                float,
-                copy=False,
-            )
+        self._linear_jacobian_values = self.A.data.astype(
+            float,
+            copy=False,
         )
 
         # =====================================================
@@ -282,9 +284,7 @@ class _CyIpoptAdapter:
                 self.n_variables,
             )
 
-            nonlinear_rows += (
-                self.n_linear_constraints
-            )
+            nonlinear_rows += self.n_linear_constraints
 
             nonlinear_cols = np.tile(
                 np.arange(
@@ -294,25 +294,25 @@ class _CyIpoptAdapter:
                 self.n_nonlinear_constraints,
             )
 
-            self._jacobian_rows = np.concatenate([
-                self._linear_jacobian_rows,
-                nonlinear_rows,
-            ])
+            self._jacobian_rows = np.concatenate(
+                [
+                    self._linear_jacobian_rows,
+                    nonlinear_rows,
+                ]
+            )
 
-            self._jacobian_cols = np.concatenate([
-                self._linear_jacobian_cols,
-                nonlinear_cols,
-            ])
+            self._jacobian_cols = np.concatenate(
+                [
+                    self._linear_jacobian_cols,
+                    nonlinear_cols,
+                ]
+            )
 
         else:
 
-            self._jacobian_rows = (
-                self._linear_jacobian_rows
-            )
+            self._jacobian_rows = self._linear_jacobian_rows
 
-            self._jacobian_cols = (
-                self._linear_jacobian_cols
-            )
+            self._jacobian_cols = self._linear_jacobian_cols
 
         # Updated through IPOPT's intermediate callback.
         self.iteration_count = 0
@@ -321,18 +321,12 @@ class _CyIpoptAdapter:
     # Objective
     # =========================================================
 
-    def objective(
-        self,
-        x,
-    ):
-        return float(
-            self.problem.objective(x)
-        )
+    def objective(self, x,):
+        """Return the scalar objective value for IPOPT."""
+        return float(self.problem.objective(x))
 
-    def gradient(
-        self,
-        x,
-    ):
+    def gradient(self, x,):
+        """Return the objective gradient as a flat vector."""
         gradient = np.asarray(
             self.problem.gradient(x),
             dtype=float,
@@ -340,9 +334,7 @@ class _CyIpoptAdapter:
 
         if gradient.size != len(x):
             raise ValueError(
-                "problem.gradient() returned "
-                "an invalid shape."
-            )
+                "problem.gradient() returned " "an invalid shape.")
 
         return gradient
 
@@ -350,85 +342,77 @@ class _CyIpoptAdapter:
     # Constraints
     # =========================================================
 
-    def constraints(
-        self,
-        x,
-    ):
+    def constraints(self, x,):
+        """
+        Evaluate the complete constraint vector.
+
+        Linear constraints are returned first, followed by nonlinear
+        constraints when present:
+
+            g(x) = [A @ x, g_nonlinear(x)]
+        """
+
         linear_values = np.asarray(
             self.A @ x,
             dtype=float,
         ).reshape(-1)
 
-        if (
-            self.n_nonlinear_constraints
-            == 0
-        ):
+        if self.n_nonlinear_constraints == 0:
             return linear_values
 
         nonlinear_values = np.asarray(
-            self.problem
-            .nonlinear_constraints(
-                x
-            ),
+            self.problem.nonlinear_constraints(x),
             dtype=float,
         ).reshape(-1)
 
-        if nonlinear_values.size != (
-            self.n_nonlinear_constraints
-        ):
+        if nonlinear_values.size != (self.n_nonlinear_constraints):
             raise ValueError(
-                "problem.nonlinear_constraints() "
-                "returned an invalid shape."
+                "problem.nonlinear_constraints() " "returned an invalid shape."
             )
 
-        return np.concatenate([
-            linear_values,
-            nonlinear_values,
-        ])
+        return np.concatenate(
+            [
+                linear_values,
+                nonlinear_values,
+            ]
+        )
 
-    def jacobianstructure(
-        self,
-    ):
+    def jacobianstructure(self,):
+        """
+        Return the fixed Jacobian sparsity pattern.
+
+        Returns:
+            (rows, cols): Arrays of row and column indices for all
+            Jacobian entries supplied to IPOPT.
+        """
+
         return (
             self._jacobian_rows,
             self._jacobian_cols,
         )
 
-    def jacobian(
-        self,
-        x,
-    ):
-        # -----------------------------------------------------
-        # No nonlinear constraints:
-        #
-        # exactly the historical behavior.
-        # -----------------------------------------------------
+    def jacobian(self, x,):
+        """
+        Return Jacobian values in the fixed sparsity ordering.
 
-        if (
-            self.n_nonlinear_constraints
-            == 0
-        ):
-            return (
-                self._linear_jacobian_values
-            )
+        Linear Jacobian values are followed by the flattened nonlinear
+        Jacobian in row-major order.
+
+        The returned values correspond exactly to the indices from
+        jacobianstructure().
+        """
+
+        if self.n_nonlinear_constraints == 0:
+            return self._linear_jacobian_values
 
         # -----------------------------------------------------
         # Nonlinear Jacobian
         # -----------------------------------------------------
 
-        J_nonlinear = (
-            self.problem
-            .nonlinear_constraints_jacobian(
-                x
-            )
-        )
+        J_nonlinear = self.problem.nonlinear_constraints_jacobian(x)
 
-        if sp.issparse(
-            J_nonlinear
-        ):
-            J_nonlinear = (
-                J_nonlinear.toarray()
-            )
+        if sp.issparse(J_nonlinear):
+            J_nonlinear = J_nonlinear.toarray()
         else:
             J_nonlinear = np.asarray(
                 J_nonlinear,
@@ -440,9 +424,7 @@ class _CyIpoptAdapter:
             self.n_variables,
         )
 
-        if J_nonlinear.shape != (
-            expected_shape
-        ):
+        if J_nonlinear.shape != (expected_shape):
             raise ValueError(
                 "problem."
                 "nonlinear_constraints_jacobian() "
@@ -457,15 +439,14 @@ class _CyIpoptAdapter:
         # row 0, all columns
         # row 1, all columns
         # ...
-        nonlinear_values = (
-            J_nonlinear
-            .reshape(-1)
-        )
+        nonlinear_values = J_nonlinear.reshape(-1)
 
-        return np.concatenate([
-            self._linear_jacobian_values,
-            nonlinear_values,
-        ])
+        return np.concatenate(
+            [
+                self._linear_jacobian_values,
+                nonlinear_values,
+            ]
+        )
 
     # =========================================================
     # Iteration callback
@@ -485,13 +466,16 @@ class _CyIpoptAdapter:
         alpha_pr,
         ls_trials,
     ):
-        self.iteration_count = int(
-            iter_count
-        )
+        """
+        Record iteration count and objective history during optimization.
 
-        self.objective_history.append(
-            float(obj_value)
-        )
+        Returns:
+            True to allow IPOPT to continue.
+        """
+
+        self.iteration_count = int(iter_count)
+
+        self.objective_history.append(float(obj_value))
 
         return True
 
@@ -513,23 +497,24 @@ class IpoptSolver:
         print_level=0,
         options=None,
     ):
-        self.tolerance = float(
-            tolerance
-        )
+        """
+        Configure the IPOPT solver.
 
-        self.max_iterations = int(
-            max_iterations
-        )
+        Args:
+            tolerance: Convergence tolerance passed to IPOPT.
+            max_iterations: Maximum number of IPOPT iterations.
+            print_level: IPOPT output verbosity level.
+            options: Optional dictionary of additional IPOPT options.
+                These options are applied last and may override defaults.
+        """
 
-        self.print_level = int(
-            print_level
-        )
+        self.tolerance = float(tolerance)
 
-        self.options = (
-            {}
-            if options is None
-            else dict(options)
-        )
+        self.max_iterations = int(max_iterations)
+
+        self.print_level = int(print_level)
+
+        self.options = {} if options is None else dict(options)
 
         self._validate_parameters()
 
@@ -537,23 +522,16 @@ class IpoptSolver:
     # Validation
     # =========================================================
 
-    def _validate_parameters(
-        self,
-    ):
+    def _validate_parameters(self,):
+        """Validate the solver tolerance, iteration limit and verbosity."""
         if self.tolerance <= 0.0:
-            raise ValueError(
-                "tolerance must be positive."
-            )
+            raise ValueError("tolerance must be positive.")
 
         if self.max_iterations <= 0:
-            raise ValueError(
-                "max_iterations must be positive."
-            )
+            raise ValueError("max_iterations must be positive.")
 
         if self.print_level < 0:
-            raise ValueError(
-                "print_level must be non-negative."
-            )
+            raise ValueError("print_level must be non-negative.")
 
     # =========================================================
     # Solve
@@ -566,7 +544,30 @@ class IpoptSolver:
         *,
         verbose=False,
     ):
-        """Solve a trajectory optimization problem using IPOPT."""
+        """
+        Solve a trajectory optimization problem using IPOPT.
+
+        The optimization variables are the flattened B-spline control
+        points. Joint limits remain expressed as general linear
+        constraints, matching the Gauss-Newton formulation.
+
+        Args:
+            problem: Optimization problem providing a spline, objective,
+                gradient, linear constraints, and optional nonlinear
+                constraints.
+            initial_control_points: Initial control points, shaped
+                (Nc, n_dof) or flattened.
+            verbose: Increase IPOPT output verbosity.
+
+        Returns:
+            IpoptOptimizationResult containing optimized control points,
+            termination status, timing and convergence diagnostics.
+
+        Raises:
+            ImportError: If CyIpopt is unavailable.
+            ValueError: If the initial points or constraint dimensions
+                are inconsistent.
+        """
 
         if cyipopt is None:
             raise ImportError(
@@ -580,12 +581,12 @@ class IpoptSolver:
             dtype=float,
         ).reshape(-1)
 
+        if not np.all(np.isfinite(x0)):
+            raise ValueError("Initial control points must be finite.")
+
         n_variables = x0.size
 
-        expected_variables = (
-            problem.spline.n_control_points
-            * problem.spline.n_dof
-        )
+        expected_variables = problem.spline.n_control_points * problem.spline.n_dof
 
         if n_variables != expected_variables:
             raise ValueError(
@@ -599,21 +600,22 @@ class IpoptSolver:
             "gradient",
         ):
             raise AttributeError(
-                "The problem must provide "
-                "a gradient(c) method."
-            )
+                "The problem must provide " "a gradient(c) method.")
 
         # -----------------------------------------------------
         # CyIpopt adapter
         # -----------------------------------------------------
 
-        adapter = _CyIpoptAdapter(
-            problem
-        )
+        adapter = _CyIpoptAdapter(problem)
 
-        n_constraints = (
-            adapter.constraint_lower.size
-        )
+        if adapter.n_variables != n_variables:
+            raise ValueError(
+                "Linear constraint matrix has "
+                f"{adapter.n_variables} columns, "
+                f"expected {n_variables}."
+            )
+
+        n_constraints = adapter.constraint_lower.size
 
         # -----------------------------------------------------
         # Variable bounds
@@ -686,9 +688,7 @@ class IpoptSolver:
 
         # User options are applied last, allowing explicit
         # overrides when experimenting with IPOPT.
-        for name, value in (
-            self.options.items()
-        ):
+        for name, value in self.options.items():
             nlp.add_option(
                 name,
                 value,
@@ -700,14 +700,9 @@ class IpoptSolver:
 
         start_time = perf_counter()
 
-        x_opt, info = nlp.solve(
-            x0
-        )
+        x_opt, info = nlp.solve(x0)
 
-        solve_time = (
-            perf_counter()
-            - start_time
-        )
+        solve_time = perf_counter() - start_time
 
         x_opt = np.asarray(
             x_opt,
@@ -742,47 +737,28 @@ class IpoptSolver:
             status_message,
             bytes,
         ):
-            status_message = (
-                status_message.decode(
-                    errors="replace"
-                )
-            )
+            status_message = status_message.decode(errors="replace")
 
-        objective = float(
-            info.get(
-                "obj_val",
-                problem.objective(
-                    x_opt
-                ),
-            )
-        )
+        objective = info.get("obj_val")
 
-        control_points = (
-            x_opt.reshape(
-                problem.spline.n_control_points,
-                problem.spline.n_dof,
-            )
+        if objective is None:
+            objective = problem.objective(x_opt)
+
+        objective = float(objective)
+
+        control_points = x_opt.reshape(
+            problem.spline.n_control_points,
+            problem.spline.n_dof,
         )
 
         return IpoptOptimizationResult(
             control_points=control_points,
-
             success=success,
             status=status,
-            status_message=str(
-                status_message
-            ),
-
+            status_message=str(status_message),
             objective=objective,
-            iterations=(
-                adapter.iteration_count
-            ),
-            solve_time=float(
-                solve_time
-            ),
-
+            iterations=(adapter.iteration_count),
+            solve_time=float(solve_time),
             raw_info=info,
-            objective_history=(
-                adapter.objective_history.copy()
-            ),
+            objective_history=(adapter.objective_history.copy()),
         )

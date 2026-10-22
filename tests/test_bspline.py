@@ -1,6 +1,6 @@
 import numpy as np
 from scipy.interpolate import BSpline as SciPyBSpline
-
+import pytest
 from splineopt.bspline import (
     BSpline,
     gamma,
@@ -611,3 +611,34 @@ def test_smoothness_matrix_properties():
     eigenvalues = np.linalg.eigvalsh(R2)
 
     assert np.min(eigenvalues) > -1e-10
+
+
+def test_segment_near_final_time():
+    """Times close to t_end must keep their correct segment."""
+    knots = np.array([
+        0.0, 0.0, 0.0, 0.0,
+        0.5, 0.999999,
+        1.0, 1.0, 1.0, 1.0,
+    ])
+
+    spline = BSpline(
+        knots=knots,
+        degree=3,
+        n_dof=2,
+    )
+
+    assert spline.segment(0.999995) == 1
+    assert spline.segment(0.9999995) == 2
+    assert spline.segment(1.0) == 2
+
+
+def test_reject_zero_duration_domain():
+    """A spline must have at least one non-empty knot span."""
+    knots = np.ones(10)
+
+    with pytest.raises(ValueError, match="positive duration"):
+        BSpline(
+            knots=knots,
+            degree=3,
+            n_dof=2,
+        )

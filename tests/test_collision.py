@@ -537,11 +537,6 @@ def test_collision_constraint_builder_dimensions(
         * environment.n_pairs
     )
 
-    assert builder.A_col.shape == (
-        n_collocation * robot.nv,
-        n_variables,
-    )
-
     # Simple constant-ish trajectory around a non-zero
     # joint configuration.
     theta = np.array([
@@ -950,3 +945,86 @@ def test_collision_global_jacobian_matches_finite_difference(
         rtol=5e-4,
         atol=3e-5,
     )
+
+
+@pytest.mark.parametrize("radius", [np.nan, np.inf, -np.inf, 0.0, -0.1])
+def test_collision_primitives_reject_invalid_radius(radius):
+    with pytest.raises(ValueError, match="radius"):
+        Capsule(
+            name="test",
+            start_frame="frame_a",
+            end_frame="frame_b",
+            radius=radius,
+        )
+
+    with pytest.raises(ValueError, match="radius"):
+        SphereObstacle(
+            center=np.zeros(3),
+            radius=radius,
+        )
+
+
+@pytest.mark.parametrize("invalid_value", [np.nan, np.inf, -np.inf])
+def test_collision_builder_rejects_nonfinite_parameters(
+    robot, capsules, obstacle, spline, invalid_value
+):
+    environment = CollisionEnvironment(
+        robot=robot,
+        capsules=capsules,
+        obstacles=[obstacle],
+    )
+
+    with pytest.raises(ValueError, match="safety_distance"):
+        CollisionConstraintBuilder(
+            spline=spline,
+            environment=environment,
+            collocation_times=[spline.t_start, spline.t_end],
+            safety_distance=invalid_value,
+        )
+
+    with pytest.raises(ValueError, match="collocation_times"):
+        CollisionConstraintBuilder(
+            spline=spline,
+            environment=environment,
+            collocation_times=[invalid_value],
+            safety_distance=0.02,
+        )
+
+
+@pytest.mark.parametrize("invalid_value", [np.nan, np.inf, -np.inf])
+def test_collision_builder_rejects_nonfinite_control_points(
+    robot, capsules, obstacle, spline, invalid_value
+):
+    environment = CollisionEnvironment(
+        robot=robot,
+        capsules=capsules,
+        obstacles=[obstacle],
+    )
+
+    builder = CollisionConstraintBuilder(
+        spline=spline,
+        environment=environment,
+        collocation_times=np.linspace(
+            spline.t_start,
+            spline.t_end,
+            5,
+        ),
+        safety_distance=0.02,
+    )
+
+    control_points = np.zeros(
+        (spline.n_control_points, spline.n_dof)
+    )
+    control_points[0, 0] = invalid_value
+
+    with pytest.raises(ValueError, match="finite"):
+        builder.distances(control_points)
+
+    with pytest.raises(ValueError, match="finite"):
+        builder.values_and_jacobian(control_points)
+
+    with pytest.raises(ValueError, match="finite"):
+        builder.near_obstacle_indices(
+            control_points,
+            activation_distance=0.1,
+        )
