@@ -1028,3 +1028,107 @@ def test_collision_builder_rejects_nonfinite_control_points(
             control_points,
             activation_distance=0.1,
         )
+
+
+def test_near_obstacle_indices(robot, capsules, spline):
+    q = robot.neutral()
+    center_near = robot.frame_position(
+        q, frame="shoulder_link"
+    )
+
+    obstacles = [
+        SphereObstacle(
+            name="near",
+            center=center_near,
+            radius=0.1,
+        ),
+        SphereObstacle(
+            name="far",
+            center=np.array([100.0, 100.0, 100.0]),
+            radius=0.1,
+        ),
+    ]
+
+    environment = CollisionEnvironment(
+        robot=robot,
+        capsules=capsules,
+        obstacles=obstacles,
+    )
+
+    builder = CollisionConstraintBuilder(
+        spline=spline,
+        environment=environment,
+        collocation_times=np.linspace(
+            spline.t_start, spline.t_end, 5
+        ),
+        safety_distance=0.02,
+    )
+
+    control_points = np.zeros(
+        (spline.n_control_points, spline.n_dof)
+    )
+
+    indices = builder.near_obstacle_indices(
+        control_points,
+        activation_distance=0.05,
+        n_samples=5,
+    )
+
+    assert indices == (0,)
+
+
+def test_subset_for_obstacles(robot, capsules, spline):
+    obstacles = [
+        SphereObstacle(
+            name="first",
+            center=np.array([0.4, 0.0, 0.5]),
+            radius=0.1,
+        ),
+        SphereObstacle(
+            name="second",
+            center=np.array([0.6, 0.0, 0.5]),
+            radius=0.1,
+        ),
+    ]
+
+    environment = CollisionEnvironment(
+        robot=robot,
+        capsules=capsules,
+        obstacles=obstacles,
+    )
+
+    times = np.linspace(spline.t_start, spline.t_end, 5)
+
+    builder = CollisionConstraintBuilder(
+        spline=spline,
+        environment=environment,
+        collocation_times=times,
+        safety_distance=0.02,
+    )
+
+    subset = builder.subset_for_obstacles([1])
+
+    assert subset.environment.n_obstacles == 1
+    assert subset.environment.obstacles[0].name == "second"
+    assert subset.environment.n_capsules == len(capsules)
+    assert subset.n_constraints == len(times) * len(capsules)
+
+    np.testing.assert_array_equal(
+        subset.collocation_times,
+        builder.collocation_times,
+    )
+
+    assert subset.safety_distance == builder.safety_distance
+
+    # An empty subset must remain valid.
+    empty = builder.subset_for_obstacles([])
+
+    assert not empty.has_constraints
+    assert empty.n_constraints == 0
+
+    # Invalid indices must be rejected.
+    with pytest.raises(ValueError):
+        builder.subset_for_obstacles([0, 0])
+
+    with pytest.raises(ValueError):
+        builder.subset_for_obstacles([2])

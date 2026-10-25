@@ -446,3 +446,124 @@ def test_invalid_cost_parameters_are_rejected(
             kinova_case,
             **{parameter: invalid_value},
         )
+
+
+@pytest.mark.parametrize("orientation_scale", [0.0, 0.1])
+def test_cartesian_residual_jacobian_finite_difference(
+    kinova_case,
+    orientation_scale,
+):
+    problem = make_problem(
+        kinova_case,
+        orientation_scale=orientation_scale,
+        lambda_smooth=1e-5,
+    )
+
+    c = kinova_case["initial_control_points"].reshape(-1).copy()
+
+    # Perturb the initial trajectory to avoid a trivial configuration.
+    rng = np.random.default_rng(42)
+    c += rng.normal(scale=0.01, size=c.shape)
+
+    residual, J = problem.residual_and_jacobian(c)
+
+    rng = np.random.default_rng(123)
+    direction = rng.normal(size=c.size)
+    direction /= np.linalg.norm(direction)
+
+    eps = 1e-6
+
+    r_plus = problem.residual(c + eps * direction)
+    r_minus = problem.residual(c - eps * direction)
+
+    numerical = (r_plus - r_minus) / (2.0 * eps)
+    analytical = J @ direction
+
+    np.testing.assert_allclose(
+        analytical,
+        numerical,
+        rtol=1e-3,
+        atol=1e-5,
+    )
+
+
+@pytest.mark.parametrize("orientation_scale", [0.0, 0.1])
+def test_cartesian_objective_gradient_finite_difference(
+    kinova_case,
+    orientation_scale,
+):
+    problem = make_problem(
+        kinova_case,
+        orientation_scale=orientation_scale,
+        lambda_smooth=1e-2,
+        lambda_terminal=1.0,
+    )
+
+    c = kinova_case["initial_control_points"].reshape(-1).copy()
+
+    rng = np.random.default_rng(42)
+    c += rng.normal(scale=0.01, size=c.shape)
+
+    analytical = problem.gradient(c)
+
+    direction = rng.normal(size=c.size)
+    direction /= np.linalg.norm(direction)
+
+    eps = 1e-6
+
+    numerical = (
+        problem.objective(c + eps * direction)
+        - problem.objective(c - eps * direction)
+    ) / (2.0 * eps)
+
+    np.testing.assert_allclose(
+        analytical @ direction,
+        numerical,
+        rtol=1e-3,
+        atol=1e-5,
+    )
+
+
+def test_gauss_newton_preserves_exact_reference(kinova_case):
+    case = kinova_case
+    problem = make_problem(
+        case,
+        orientation_scale=0.1,
+        lambda_smooth=0.0,
+    )
+
+    # An unchanged initial trajectory is not the target in this fixture.
+    # Construct a new problem whose reference matches that trajectory.
+    initial_cp = case["initial_control_points"].copy()
+
+    q_pin = case["robot"].joint_positions_to_configuration(case["q0"])
+    target_pose = case["robot"].frame_pose(q_pin)
+
+    problem.update(
+        case["q0"],
+        case["v0"],
+        [target_pose.copy() for _ in case["tracking_times"]],
+    )
+
+    initial_cost = problem.objective(initial_cp)
+
+    solver = GaussNewtonSolver(
+        damping=1e-3,
+        max_iterations=5,
+    )
+
+    result = solver.solve(
+        problem=problem,
+        initial_control_points=initial_cp,
+    )
+
+    final_cost = problem.objective(result.control_points)
+
+    assert initial_cost < 1e-10
+    assert final_cost < 1e-10
+
+    np.testing.assert_allclose(
+        result.control_points,
+        initial_cp,
+        atol=1e-5,
+    )

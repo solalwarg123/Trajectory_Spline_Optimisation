@@ -101,3 +101,112 @@ def test_update_equivalent_to_rebuild(
 
     np.testing.assert_allclose(l1, l2)
     np.testing.assert_allclose(u1, u2)
+
+
+def test_update_invalid_input_preserves_problem(kinova_case):
+    case = kinova_case
+    n = case["spline"].n_dof
+
+    problem = CartesianTrajectoryProblem(
+        robot=case["robot"],
+        spline=case["spline"],
+        tracking_times=case["tracking_times"],
+        target_poses=case["target_poses"],
+        q0=case["q0"],
+        v0=case["v0"],
+        q_min=np.full(n, -10.0),
+        q_max=np.full(n, 10.0),
+        v_min=np.full(n, -10.0),
+        v_max=np.full(n, 10.0),
+        a_min=np.full(n, -10.0),
+        a_max=np.full(n, 10.0),
+        a0=case["a0"],
+        orientation_scale=0.1,
+    )
+
+    _, l_before, u_before = problem.linear_constraints()
+    l_before = l_before.copy()
+    u_before = u_before.copy()
+
+    q_before = problem.q0.copy()
+    v_before = problem.v0.copy()
+
+    poses_before = [
+        pose.homogeneous.copy()
+        for pose in problem.target_poses
+    ]
+
+    invalid_q = case["q0"].copy()
+    invalid_q[0] = np.nan
+
+    with pytest.raises(ValueError):
+        problem.update(
+            invalid_q,
+            case["v0"],
+            case["target_poses"],
+        )
+
+    np.testing.assert_array_equal(problem.q0, q_before)
+    np.testing.assert_array_equal(problem.v0, v_before)
+
+    _, l_after, u_after = problem.linear_constraints()
+
+    np.testing.assert_array_equal(l_after, l_before)
+    np.testing.assert_array_equal(u_after, u_before)
+
+    for pose, expected in zip(
+        problem.target_poses, poses_before
+    ):
+        np.testing.assert_array_equal(
+            pose.homogeneous,
+            expected,
+        )
+
+
+def test_update_copies_target_poses(kinova_case):
+    case = kinova_case
+    n = case["spline"].n_dof
+
+    problem = CartesianTrajectoryProblem(
+        robot=case["robot"],
+        spline=case["spline"],
+        tracking_times=case["tracking_times"],
+        target_poses=case["target_poses"],
+        q0=case["q0"],
+        v0=case["v0"],
+        q_min=np.full(n, -10.0),
+        q_max=np.full(n, 10.0),
+        v_min=np.full(n, -10.0),
+        v_max=np.full(n, 10.0),
+        a_min=np.full(n, -10.0),
+        a_max=np.full(n, 10.0),
+        a0=case["a0"],
+    )
+
+    poses = [
+        pin.SE3(
+            pose.rotation.copy(),
+            pose.translation.copy(),
+        )
+        for pose in case["target_poses"]
+    ]
+
+    problem.update(
+        case["q0"],
+        case["v0"],
+        poses,
+    )
+
+    saved_position = problem.target_poses[0].translation.copy()
+
+    poses[0].translation[0] += 1.0
+
+    np.testing.assert_array_equal(
+        problem.target_poses[0].translation,
+        saved_position,
+    )
+
+    np.testing.assert_array_equal(
+        problem._target_positions[0],
+        saved_position,
+    )

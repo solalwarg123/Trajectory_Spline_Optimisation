@@ -1143,3 +1143,33 @@ def test_ipopt_solves_problem_with_nonlinear_constraint():
         nonlinear_value
         >= 2.0 - 1e-7
     )
+
+
+def test_ipopt_unavailable_raises_import_error(monkeypatch):
+    import splineopt.ipopt_solver as ipopt_module
+
+    monkeypatch.setattr(ipopt_module, "cyipopt", None)
+
+    solver = IpoptSolver()
+    problem = QuadraticConstrainedProblem()
+
+    with pytest.raises(ImportError, match="CyIpopt is not installed"):
+        solver.solve(
+            problem=problem,
+            initial_control_points=np.array([[0.0, 3.0]]),
+        )
+
+
+@requires_ipopt
+@pytest.mark.parametrize("invalid_value", [np.nan, np.inf, -np.inf])
+def test_ipopt_rejects_nonfinite_initial_points(invalid_value):
+    problem = QuadraticConstrainedProblem()
+    solver = IpoptSolver()
+
+    initial = np.array([[invalid_value, 3.0]])
+
+    with pytest.raises(ValueError, match="finite"):
+        solver.solve(
+            problem=problem,
+            initial_control_points=initial,
+        )

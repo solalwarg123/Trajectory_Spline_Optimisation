@@ -436,3 +436,113 @@ def test_mpc_invalid_gn_result_with_collision_filtering(
             mpc.previous_control_points,
             initial,
         )
+
+
+@pytest.mark.parametrize(
+    "invalid_control_points",
+    [
+        np.zeros((3, 2)),
+        np.full((4, 2), np.nan),
+        np.full((4, 2), np.inf),
+    ],
+)
+def test_mpc_reset_rejects_invalid_control_points(
+    invalid_control_points,
+):
+    initial = np.zeros((4, 2))
+
+    mpc = CartesianMPC(
+        FakeProblem(),
+        FakeSolver(),
+        initial,
+        project_warm_start=False,
+    )
+
+    with pytest.raises(ValueError):
+        mpc.reset(invalid_control_points)
+
+    np.testing.assert_array_equal(
+        mpc.previous_control_points,
+        initial,
+    )
+
+
+@pytest.mark.parametrize(
+    "tolerance, expected_accepted",
+    [
+        (1e-5, False),
+        (1e-3, True),
+    ],
+)
+def test_mpc_linear_feasibility_tolerance(
+    tolerance,
+    expected_accepted,
+):
+    initial = np.zeros((4, 2))
+
+    # ConstraintProblem imposes bounds [-0.5, 0.5].
+    # This candidate exceeds the upper bound by 1e-4.
+    candidate = np.full((4, 2), 0.5001)
+
+    mpc = CartesianMPC(
+        ConstraintProblem(),
+        FixedSolver(candidate),
+        initial,
+        project_warm_start=False,
+        linear_feasibility_tolerance=tolerance,
+    )
+
+    mpc.step(
+        np.zeros(2),
+        np.zeros(2),
+        [],
+    )
+
+    info = mpc.last_solution_info
+
+    assert info["accepted"] == expected_accepted
+    assert info["linear_feasible"] == expected_accepted
+
+    np.testing.assert_allclose(
+        info["linear_violation"],
+        1e-4,
+        atol=1e-12,
+    )
+
+    expected = candidate if expected_accepted else initial
+
+    np.testing.assert_allclose(
+        mpc.previous_control_points,
+        expected,
+    )
+
+
+def test_mpc_accepted_solution_is_copied():
+    initial = np.zeros((4, 2))
+    candidate = np.full((4, 2), 0.25)
+
+    mpc = CartesianMPC(
+        ConstraintProblem(),
+        FixedSolver(candidate),
+        initial,
+        project_warm_start=False,
+    )
+
+    result = mpc.step(
+        np.zeros(2),
+        np.zeros(2),
+        [],
+    )
+
+    assert mpc.last_solution_info["accepted"]
+
+    saved = mpc.previous_control_points.copy()
+
+    # Modifying the externally returned result must not
+    # affect the internal MPC warm start.
+    result.control_points[:] = 0.4
+
+    np.testing.assert_array_equal(
+        mpc.previous_control_points,
+        saved,
+    )
