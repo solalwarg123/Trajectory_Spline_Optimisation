@@ -33,6 +33,9 @@ from examples.utils.kinova_helpers import (
     plot_feasibility_usage,
 )
 
+from examples.utils.kinova_visualization import (
+    animate_kinova_trajectories,
+)
 
 METHODS = ("joint", "gn-pos", "gn-pose", "ipopt")
 
@@ -239,11 +242,18 @@ def run(args):
         plt.pause(0.5)
 
     if not args.no_animation:
-        animate_meshcat(
-            robot,
-            results,
-            dense_times,
+        animate_kinova_trajectories(
+            robot=robot,
+            trajectories={
+                name: {
+                    "q": result["q"],
+                    "times": dense_times,
+                    "label": name,
+                }
+                for name, result in results.items()
+            },
             speed=args.animation_speed,
+            title="KINOVA OFFLINE OPTIMIZATION",
         )
 
     elif not args.no_plots:

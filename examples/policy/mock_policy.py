@@ -10,10 +10,9 @@ from dataclasses import dataclass
 import numpy as np
 import pinocchio as pin
 
-from examples.kinova_trajectory_projection import (
+from examples.utils.kinova_helpers import (
     Q_MIN, Q_MAX, V_MIN, V_MAX, A_MIN, A_MAX,
 )
-
 
 TIME_SCALE = 2.30
 
