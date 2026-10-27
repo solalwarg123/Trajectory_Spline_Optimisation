@@ -98,23 +98,31 @@ def enforce_initial_state_on_guess(
 
 
 def max_linear_violation(problem, control_points):
-    """Maximum violation of the linear MPC constraints."""
+    """Return the maximum linear MPC constraint violation."""
     A, lower, upper = problem.linear_constraints()
 
-    values = np.asarray(
-        A @ np.asarray(control_points).reshape(-1)
+    x = np.asarray(
+        control_points, dtype=float
     ).reshape(-1)
 
+    if not np.all(np.isfinite(x)):
+        return float("inf")
+
+    values = np.asarray(A @ x).reshape(-1)
+
+    if not np.all(np.isfinite(values)):
+        return float("inf")
+
     return float(max(
+        0.0,
         np.max(lower - values),
         np.max(values - upper),
-        0.0,
     ))
-
 
 # ============================================================
 # Feasible Cartesian MPC reference
 # ============================================================
+
 
 def reference_state(t):
     """Analytically bounded two-harmonic joint trajectory."""

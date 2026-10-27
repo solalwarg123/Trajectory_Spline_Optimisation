@@ -25,8 +25,6 @@ from examples.utils.kinova_helpers import (
     fk_trajectory,
     trajectory_metrics,
     print_summary,
-    show_plots,
-    animate_meshcat,
     plot_cartesian_3d,
     plot_cartesian_errors,
     plot_joint_quantities,

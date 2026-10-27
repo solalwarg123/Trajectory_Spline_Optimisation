@@ -12,9 +12,9 @@ Features:
 - CSV exports, Matplotlib plots and replayable Meshcat animation
 
 Examples:
-    python -m examples.kinova_mpc_obstacle_benchmark --solver gn --limits 5
-    python -m examples.kinova_mpc_obstacle_benchmark --solver both --limits 20 50
-    python -m examples.kinova_mpc_obstacle_benchmark --solver gn --limits 5 --show-plots
+    python -m examples.mpc.kinova_mpc_obstacle_benchmark --solver gn --limits 5
+    python -m examples.mpc.kinova_mpc_obstacle_benchmark --solver both --limits 20 50
+    python -m examples.mpc.kinova_mpc_obstacle_benchmark --solver gn --limits 5 --show-plots
 """
 
 import argparse

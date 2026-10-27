@@ -18,10 +18,10 @@ Features:
     - Interactive Meshcat trajectory replay
 
 Examples:
-    python -m examples.kinova_mpc_cluttered_tracking
-    python -m examples.kinova_mpc_cluttered_tracking --show-plots
-    python -m examples.kinova_mpc_cluttered_tracking --gn-iters 2 5
-    python -m examples.kinova_mpc_cluttered_tracking --steps 20 --no-animation
+    python -m examples.mpc.kinova_mpc_cluttered_tracking
+    python -m examples.mpc.kinova_mpc_cluttered_tracking --show-plots
+    python -m examples.mpc.kinova_mpc_cluttered_tracking --gn-iters 2 5
+    python -m examples.mpc.kinova_mpc_cluttered_tracking --steps 20 --no-animation
 """
 
 import argparse
@@ -57,6 +57,7 @@ from examples.utils.mpc_helpers import (
     reference_pose,
     validate_reference,
     bound_violation,
+    max_linear_violation
 )
 from examples.utils.collision_visualization import (
     CAPSULES as KINOVA_CAPSULES,
@@ -91,22 +92,6 @@ def finite_values(rows, key):
         dtype=float,
     )
     return values[np.isfinite(values)]
-
-
-def linear_violation(problem, control_points):
-    """Maximum finite linear constraint violation."""
-    A, lower, upper = problem.linear_constraints()
-    x = np.asarray(control_points, dtype=float).reshape(-1)
-    values = np.asarray(A @ x).reshape(-1)
-
-    if not np.all(np.isfinite(values)):
-        return np.inf
-
-    return float(max(
-        0.0,
-        np.max(lower - values),
-        np.max(values - upper),
-    ))
 
 
 def print_linear_failure(problem, control_points):
@@ -683,7 +668,7 @@ def simulate(
                     )
 
                 row["gn_linear_violation"] = (
-                    linear_violation(problem, candidate_c)
+                    max_linear_violation(problem, candidate_c)
                 )
 
                 if mode == "SAFE":

@@ -43,7 +43,7 @@ from examples.utils.kinova_helpers import (
     A_MIN,
     A_MAX,
 )
-from examples.utils.mpc_helpers import make_spline, pose_from_theta
+from examples.utils.mpc_helpers import make_spline, pose_from_theta, max_linear_violation
 from examples.utils.kinova_visualization import (
     animate_kinova_trajectories,
 )
@@ -82,22 +82,6 @@ def max_violation(x, lower, upper):
     return float(np.max(np.maximum(
         np.maximum(lower - x, x - upper), 0.0
     )))
-
-
-def linear_violation(problem, controls):
-    A, lower, upper = problem.linear_constraints()
-    values = np.asarray(
-        A @ np.asarray(controls).reshape(-1)
-    ).reshape(-1)
-
-    if not np.all(np.isfinite(values)):
-        return float("inf")
-
-    return float(max(
-        0.0,
-        np.max(lower - values),
-        np.max(values - upper),
-    ))
 
 
 def save_csv(path, rows):
@@ -410,7 +394,7 @@ def simulate_mpc(robot, chunks, times, args):
             spline.n_control_points, robot.nv
         )
 
-        violation = linear_violation(problem, c)
+        violation = max_linear_violation(problem, c)
 
         if (
             not np.isfinite(violation)

@@ -1,13 +1,11 @@
+"""Collision utilities for the Kinova optimization examples.
 
-"""Collision utilities for the Kinova offline examples.
-
-Capsules, obstacle generation, collision constraints, validation,
-Matplotlib figures and interactive Meshcat playback.
+Capsule geometry, obstacle placement, collision constraints,
+clearance evaluation and Matplotlib visualization.
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
-import time
 from splineopt.collision import (
     Capsule, SphereObstacle, CollisionEnvironment,
     CollisionConstraintBuilder,
@@ -29,12 +27,6 @@ COLORS = {
     "free": "tab:orange",
     "gn": "tab:purple",
     "ipopt": "tab:blue",
-}
-MESHCAT_COLORS = {
-    "initial": 0x888888,
-    "free": 0xFF8800,
-    "gn": 0x9933CC,
-    "ipopt": 0x0077FF,
 }
 
 
@@ -308,100 +300,3 @@ def plot_collision_results(times, reference, results, obstacle, safety):
         ax.grid(alpha=0.25)
         ax.legend()
     fig.tight_layout()
-
-
-def animate_collision_trajectories(
-    robot, results, times, obstacle, speed=2.0,
-):
-    """Replay trajectories until 0; keep Matplotlib windows visible."""
-    import meshcat.geometry as mg
-    import meshcat.transformations as mt
-
-    robot.init_viewer(open_browser=True)
-    viewer = robot.viewer.viewer
-
-    # Static obstacle and collision geometry.
-    node = viewer["collision/obstacle"]
-    node.set_object(
-        mg.Sphere(obstacle.radius),
-        mg.MeshLambertMaterial(color=0xFF4444, opacity=0.5, transparent=True),
-    )
-    node.set_transform(mt.translation_matrix(obstacle.center))
-
-    for name, result in results.items():
-        points = np.asarray(result["xyz"], dtype=np.float32).T
-        viewer[f"trajectories/{name}"].set_object(
-            mg.Line(
-                mg.PointsGeometry(points),
-                mg.LineBasicMaterial(
-                    color=MESHCAT_COLORS[name], linewidth=3
-                ),
-            )
-        )
-
-    # Display moving capsule approximations.
-    def display_capsules(q):
-        for capsule in CAPSULES:
-            a = robot.frame_position(q, frame=capsule.start_frame)
-            b = robot.frame_position(q, frame=capsule.end_frame)
-            center = (a+b)/2
-            direction = b-a
-            length = np.linalg.norm(direction)
-            if length < 1e-9:
-                continue
-            rotation = np.eye(3)
-            y = direction / length
-            x = perpendicular(y)
-            z = np.cross(x, y)
-            rotation[:, 0], rotation[:, 1], rotation[:, 2] = x, y, z
-            transform = np.eye(4)
-            transform[:3, :3] = rotation
-            transform[:3, 3] = center
-
-            path = viewer[f"collision/capsules/{capsule.name}"]
-            path.set_object(
-                mg.Cylinder(length, capsule.radius),
-                mg.MeshLambertMaterial(
-                    color=0x33AAFF, opacity=0.25, transparent=True
-                ),
-            )
-            path.set_transform(transform)
-
-    choices = list(results)
-    try:
-        while True:
-            print("\n" + "="*45)
-            print("COLLISION ANIMATION")
-            print("="*45)
-            for i, name in enumerate(choices, 1):
-                print(f"  {i}. {name.upper()}")
-            print("  0. Close plots and exit")
-
-            try:
-                selected = input("\nSelect trajectory: ").strip()
-            except (EOFError, KeyboardInterrupt):
-                break
-
-            if selected == "0":
-                break
-            if not selected.isdigit() or not (
-                1 <= int(selected) <= len(choices)
-            ):
-                print("Invalid selection.")
-                continue
-
-            name = choices[int(selected)-1]
-            theta = results[name]["q"]
-            q_pin = robot.joint_trajectory_to_configurations(theta)
-
-            print(f"Playing {name.upper()}...")
-            for k, q in enumerate(q_pin):
-                robot.display(q)
-                display_capsules(q)
-                if k + 1 < len(times):
-                    dt = (times[k + 1] - times[k]) / speed
-                    time.sleep(max(0.0, dt))
-            print("Finished.")
-
-    finally:
-        plt.close("all")

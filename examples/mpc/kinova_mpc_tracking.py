@@ -10,9 +10,9 @@ Both solvers use identical constraints, reference trajectories
 and pre-generated disturbances in independent closed-loop runs.
 
 Examples:
-    python -m examples.kinova_mpc_tracking
-    python -m examples.kinova_mpc_tracking --solver both --show-plots
-    python -m examples.kinova_mpc_tracking --solver gn --mode kick
+    python -m examples.mpc.kinova_mpc_tracking
+    python -m examples.mpc.kinova_mpc_tracking --solver both --show-plots
+    python -m examples.mpc.kinova_mpc_tracking --solver gn --mode kick
 """
 
 import argparse

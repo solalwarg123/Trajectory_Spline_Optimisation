@@ -2,7 +2,6 @@
 """Shared Kinova reference, metrics and visualization utilities."""
 
 from pathlib import Path
-import time
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -340,91 +339,3 @@ def show_plots(times, results):
     plot_joint_quantities(times, results)
     plot_feasibility_usage(times, results)
     plt.show()
-
-
-# ============================================================
-# Meshcat animation
-# ============================================================
-
-
-def animate_meshcat(robot, results, times, speed=2.0):
-    """Interactive Meshcat playback with repeatable trajectory selection."""
-    import meshcat.geometry as mg
-
-    robot.init_viewer(open_browser=True)
-
-    viewer = robot.viewer.viewer
-
-    meshcat_colors = {
-        "nominal": 0xFF8C00,
-        "joint": 0x0077FF,
-        "gn-pos": 0x22AA55,
-        "gn-pose": 0xAA33CC,
-        "ipopt": 0xDD3333,
-    }
-
-    # Draw all trajectories once
-    for name, data in results.items():
-        points = np.asarray(data["xyz"], dtype=np.float32).T
-
-        viewer[f"trajectories/{name}"].set_object(
-            mg.Line(
-                mg.PointsGeometry(points),
-                mg.LineBasicMaterial(
-                    color=meshcat_colors[name],
-                    linewidth=3,
-                ),
-            )
-        )
-
-    choices = list(results)
-
-    try:
-        while True:
-            print("\n" + "=" * 45)
-            print("MESHCAT ANIMATION")
-            print("=" * 45)
-
-            for i, name in enumerate(choices, 1):
-                print(f"  {i}. {LABELS[name]}")
-
-            print("  0. Exit and close plots")
-
-            try:
-                selected = input("\nSelect trajectory: ").strip()
-            except EOFError:
-                break
-
-            if selected == "0":
-                break
-
-            if not selected.isdigit():
-                print("Invalid selection.")
-                continue
-
-            index = int(selected) - 1
-            if not 0 <= index < len(choices):
-                print("Invalid selection.")
-                continue
-
-            name = choices[index]
-            theta = results[name]["q"]
-            q_pin = robot.joint_trajectory_to_configurations(theta)
-
-            print(f"\nPlaying: {LABELS[name]}")
-
-            robot.display(q_pin[0])
-            time.sleep(0.3)
-
-            for i, configuration in enumerate(q_pin):
-                robot.display(configuration)
-
-                if i + 1 < len(times):
-                    dt = (times[i + 1] - times[i]) / speed
-                    time.sleep(max(0.0, dt))
-
-            print(f"Finished: {LABELS[name]}")
-
-    finally:
-        plt.close("all")
-        print("Animation session closed.")
