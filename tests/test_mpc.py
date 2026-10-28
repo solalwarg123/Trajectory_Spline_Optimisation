@@ -546,3 +546,178 @@ def test_mpc_accepted_solution_is_copied():
         mpc.previous_control_points,
         saved,
     )
+
+
+@pytest.mark.parametrize(
+    "scenario, expected_active, expected_solves",
+    [
+        ("stable", (0,), 1),
+        ("new_obstacle", (0, 1), 2),
+        ("full_retry", (0, 1, 2), 2),
+    ],
+)
+def test_mpc_dynamic_collision_activation(
+    scenario, expected_active, expected_solves
+):
+    class FakeCollision:
+        has_constraints = True
+
+        def __init__(self, indices=None):
+            self.environment = SimpleNamespace(n_obstacles=3)
+            self.indices = indices
+
+        def subset_for_obstacles(self, indices):
+            return FakeCollision(tuple(indices))
+
+        def near_obstacle_indices(self, c, **kwargs):
+            marker = float(c[0, 0])
+
+            if marker == 0.0:
+                return [0]
+
+            if scenario == "new_obstacle":
+                return [0, 1]
+
+            return [0]
+
+        def is_feasible(self, c, tolerance=1e-4):
+            if scenario == "full_retry":
+                return float(c[0, 0]) >= 2.0
+            return True
+
+    class CollisionProblem(FakeProblem):
+        def __init__(self):
+            super().__init__()
+            self.collision_constraints = FakeCollision()
+
+    class RecordingSolver:
+        def __init__(self):
+            self.active_sets = []
+
+        def solve(
+            self, problem, initial_control_points,
+            verbose=False
+        ):
+            collision = problem.collision_constraints
+            active = (
+                collision.indices
+                if collision is not None
+                else ()
+            )
+            self.active_sets.append(active)
+
+            marker = float(len(self.active_sets))
+
+            return SimpleNamespace(
+                control_points=np.full((4, 2), marker),
+                success=True,
+                status="converged",
+            )
+
+    problem = CollisionProblem()
+    solver = RecordingSolver()
+    full_collision = problem.collision_constraints
+
+    mpc = CartesianMPC(
+        problem,
+        solver,
+        np.zeros((4, 2)),
+        collision_activation_distance=0.1,
+        project_warm_start=False,
+    )
+
+    result = mpc.step(
+        np.zeros(2),
+        np.zeros(2),
+        [],
+    )
+
+    info = mpc.last_collision_info
+
+    assert info["filtered"]
+    assert info["solve_count"] == expected_solves
+    assert info["active_indices"] == expected_active
+    assert info["feasible"]
+    assert mpc.last_solution_info["accepted"]
+
+    # Collision constraints must be restored after solving.
+    assert problem.collision_constraints is full_collision
+
+    if scenario == "stable":
+        assert solver.active_sets == [(0,)]
+
+    elif scenario == "new_obstacle":
+        assert solver.active_sets == [(0,), (0, 1)]
+
+    else:
+        assert solver.active_sets == [(0,), None]
+
+    np.testing.assert_allclose(
+        mpc.previous_control_points,
+        result.control_points,
+    )
+
+
+def test_mpc_osqp_projection_and_reuse():
+    mpc = CartesianMPC(
+        ConstraintProblem(),
+        FakeSolver(),
+        np.zeros((4, 2)),
+        project_warm_start=True,
+    )
+
+    A, lower, upper = mpc.problem.linear_constraints()
+
+    # First projection: upper bounds are violated.
+    c1 = np.ones((4, 2))
+
+    projected1, info1 = mpc._project_linear_feasible(
+        c1, A, lower, upper
+    )
+
+    assert info1["projected"]
+    assert info1["before"] > 0
+    assert info1["after"] <= mpc.projection_tolerance
+
+    np.testing.assert_allclose(
+        projected1,
+        0.5,
+        atol=1e-6,
+    )
+
+    first_solver = mpc._projection_solver
+    assert first_solver is not None
+
+    # Second projection: same constraint matrix,
+    # different input and different active bounds.
+    c2 = -np.ones((4, 2))
+
+    projected2, info2 = mpc._project_linear_feasible(
+        c2, A, lower, upper
+    )
+
+    assert info2["projected"]
+    assert info2["after"] <= mpc.projection_tolerance
+
+    np.testing.assert_allclose(
+        projected2,
+        -0.5,
+        atol=1e-6,
+    )
+
+    # OSQP workspace should be reused.
+    assert mpc._projection_solver is first_solver
+
+    # Third call: already feasible trajectory.
+    c3 = np.zeros((4, 2))
+
+    projected3, info3 = mpc._project_linear_feasible(
+        c3, A, lower, upper
+    )
+
+    assert not info3["projected"]
+    assert info3["status"] == "already_feasible"
+    assert info3["iterations"] == 0
+
+    np.testing.assert_array_equal(projected3, c3)
+    assert mpc._projection_solver is first_solver

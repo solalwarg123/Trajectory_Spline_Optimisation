@@ -472,3 +472,43 @@ def test_adaptive_damping_retry_limit(monkeypatch):
         damping_values,
         [1e-3, 2e-3, 4e-3],
     )
+
+
+@pytest.mark.parametrize(
+    "status, solution, expected_error",
+    [
+        ("primal infeasible", None, "Gauss-Newton QP failed"),
+        ("maximum iterations reached", None, "Gauss-Newton QP failed"),
+        ("solved", [], "OSQP returned fewer variables"),
+    ],
+)
+def test_gauss_newton_rejects_invalid_qp_result(
+    monkeypatch, status, solution, expected_error
+):
+    from types import SimpleNamespace
+    import splineopt.optimizer as optimizer_module
+
+    class FakeOSQP:
+        def setup(self, **kwargs):
+            pass
+
+        def solve(self):
+            return SimpleNamespace(
+                info=SimpleNamespace(status=status),
+                x=solution,
+            )
+
+    monkeypatch.setattr(
+        optimizer_module.osqp,
+        "OSQP",
+        FakeOSQP,
+    )
+
+    problem = SimpleQuadraticProblem()
+    solver = GaussNewtonSolver()
+
+    with pytest.raises(RuntimeError, match=expected_error):
+        solver.gauss_newton_step(
+            problem,
+            np.array([[0.0]]),
+        )

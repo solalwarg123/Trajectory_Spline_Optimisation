@@ -11,7 +11,7 @@ from splineopt.optimizer import (
     GaussNewtonSolver,
 )
 from splineopt.robotics.robot import Robot
-
+from splineopt.mpc import CartesianMPC
 
 # ============================================================
 # Robot
@@ -567,3 +567,101 @@ def test_gauss_newton_preserves_exact_reference(kinova_case):
         initial_cp,
         atol=1e-5,
     )
+
+
+def test_cartesian_mpc_multiple_cycles(kinova_case):
+    """Test several MPC cycles with the real problem and GN solver."""
+
+    problem = make_problem(kinova_case)
+
+    solver = GaussNewtonSolver(
+        max_iterations=2,
+    )
+
+    initial = kinova_case[
+        "initial_control_points"
+    ].copy()
+
+    mpc = CartesianMPC(
+        problem=problem,
+        solver=solver,
+        initial_control_points=initial,
+        project_warm_start=True,
+    )
+
+    q_initial = kinova_case["q0"]
+    v0 = kinova_case["v0"]
+    targets = kinova_case["target_poses"]
+
+    # Simulate three successive measured states.
+    states = [
+        q_initial.copy(),
+        q_initial + np.array(
+            [0.01, 0, 0, 0, 0, 0, 0]
+        ),
+        q_initial + np.array(
+            [0.02, 0, 0, 0, 0, 0, 0]
+        ),
+    ]
+
+    previous_solution = None
+
+    for q0 in states:
+        result = mpc.step(
+            q0=q0,
+            v0=v0,
+            target_poses=targets,
+        )
+
+        assert mpc.last_solution_info["accepted"]
+
+        c = mpc.previous_control_points.copy()
+
+        assert c.shape == initial.shape
+        assert np.all(np.isfinite(c))
+
+        # Verify actual linear feasibility.
+        A, lower, upper = problem.linear_constraints()
+        values = A @ c.reshape(-1)
+
+        tol = mpc.linear_feasibility_tolerance
+
+        assert np.all(values >= lower - tol)
+        assert np.all(values <= upper + tol)
+
+        # Verify initial position and velocity.
+        c_flat = c.reshape(-1)
+
+        q_start = (
+            problem.spline.evaluation_matrix(
+                problem.spline.t_start,
+                derivative_order=0,
+            ) @ c_flat
+        )
+
+        v_start = (
+            problem.spline.evaluation_matrix(
+                problem.spline.t_start,
+                derivative_order=1,
+            ) @ c_flat
+        )
+
+        np.testing.assert_allclose(
+            q_start, q0, atol=tol
+        )
+        np.testing.assert_allclose(
+            v_start, v0, atol=tol
+        )
+
+        # Verify that the selected trajectory is stored.
+        np.testing.assert_allclose(
+            mpc.previous_control_points,
+            c,
+        )
+
+        assert result.control_points.shape == c.shape
+
+        if previous_solution is not None:
+            assert np.all(np.isfinite(previous_solution))
+
+        previous_solution = c
