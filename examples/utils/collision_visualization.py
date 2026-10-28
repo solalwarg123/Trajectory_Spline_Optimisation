@@ -277,26 +277,35 @@ def plot_collision_results(times, reference, results, obstacle, safety):
     fig.tight_layout()
 
     fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+    fig.suptitle("Collision avoidance metrics", fontsize=14, y=0.98)
 
     for name, result in results.items():
         axes[0].plot(
-            times, result["position_error"]*1000,
+            times, result["position_error"] * 1000,
             color=COLORS[name], label=name.upper(),
         )
         axes[1].plot(
-            times, result["clearance"]*1000,
+            times, result["clearance"] * 1000,
             color=COLORS[name], label=name.upper(),
         )
 
-    axes[1].axhspan(-200, 1000*safety, color="tab:red", alpha=0.08)
+    axes[0].set_title("Tracking error")
+    axes[1].set_title("Minimum clearance")
+
+    axes[1].axhspan(-200, 1000 * safety, color="tab:red", alpha=0.08)
     axes[1].axhline(
-        1000*safety, color="tab:red", linestyle="--",
+        1000 * safety,
+        color="tab:red",
+        linestyle="--",
         label="Safety threshold",
     )
+
     axes[0].set_ylabel("Position error [mm]")
     axes[1].set_ylabel("Minimum clearance [mm]")
     axes[1].set_xlabel("Time [s]")
+
     for ax in axes:
         ax.grid(alpha=0.25)
         ax.legend()
-    fig.tight_layout()
+
+    fig.tight_layout(rect=(0, 0, 1, 0.96))

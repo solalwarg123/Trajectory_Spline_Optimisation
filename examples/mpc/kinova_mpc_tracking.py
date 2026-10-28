@@ -996,16 +996,16 @@ def main():
     )
 
     parser.add_argument(
-        "--noise-accel-std", type=float, default=0.05,
+        "--noise-accel-std", type=float, default=0.35,
     )
     parser.add_argument(
         "--kick-time", type=float, default=3.0,
     )
     parser.add_argument(
-        "--kick-accel", type=float, default=0.2,
+        "--kick-accel", type=float, default=4.8,
     )
     parser.add_argument(
-        "--bias-accel", type=float, default=0.05,
+        "--bias-accel", type=float, default=1.0,
     )
     parser.add_argument(
         "--bias-start", type=float, default=2.0,
@@ -1019,7 +1019,7 @@ def main():
     parser.add_argument(
         "--max-disturbance-accel",
         type=float,
-        default=0.3,
+        default=4.9,
     )
 
     parser.add_argument("--seed", type=int, default=42)

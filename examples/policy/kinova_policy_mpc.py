@@ -994,15 +994,15 @@ def main():
 
     # Mock policy.
     parser.add_argument(
-        "--noise-std", type=float, default=0.0025
+        "--noise-std", type=float, default=0.0015
     )
     parser.add_argument(
-        "--bias-std", type=float, default=0.001
+        "--bias-std", type=float, default=0.0005
     )
     parser.add_argument(
         "--tremor-amplitude",
         type=float,
-        default=0.002,
+        default=0.001,
     )
     parser.add_argument(
         "--tremor-frequency",

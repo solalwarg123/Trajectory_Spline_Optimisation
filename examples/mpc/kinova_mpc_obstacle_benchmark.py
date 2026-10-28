@@ -72,6 +72,54 @@ def rms(values):
     return float(np.sqrt(np.mean(values**2)))
 
 
+def print_linear_diagnostics(problem, control_points, q0, v0):
+    """Report the rows responsible for linear constraint violations."""
+    A, lower, upper = problem.linear_constraints()
+
+    x = np.asarray(control_points, dtype=float).reshape(-1)
+    values = np.asarray(A @ x).reshape(-1)
+
+    violations = np.maximum.reduce([
+        np.zeros_like(values),
+        lower - values,
+        values - upper,
+    ])
+
+    n = problem.spline.n_dof
+
+    # The first 2*n rows are initial position and velocity
+    # equalities. Remaining rows are static joint constraints.
+    groups = {
+        "Initial position": slice(0, n),
+        "Initial velocity": slice(n, 2 * n),
+        "Other joint constraints": slice(2 * n, len(values)),
+    }
+
+    print("\n  LINEAR CONSTRAINT DIAGNOSTICS")
+    print(f"  q0: {np.array2string(q0, precision=5)}")
+    print(f"  v0: {np.array2string(v0, precision=5)}")
+
+    for label, indices in groups.items():
+        group = violations[indices]
+        if group.size:
+            print(f"  {label}: max violation = {np.max(group):.3e}")
+
+    worst = np.argsort(violations)[-5:][::-1]
+
+    print("  Worst constraint rows:")
+    for i in worst:
+        if violations[i] <= 0:
+            continue
+
+        print(
+            f"    row={i:4d} "
+            f"value={values[i]: .6e} "
+            f"lower={lower[i]: .6e} "
+            f"upper={upper[i]: .6e} "
+            f"violation={violations[i]:.3e}"
+        )
+
+
 def unit_vector(values):
     values = np.asarray(values, dtype=float)
     norm = np.linalg.norm(values)
@@ -472,6 +520,9 @@ def run_experiment(
                 )
 
             if linear_violation > args.feasibility_tol:
+                if args.verbose:
+                    print_linear_diagnostics(problem, c, q, v)
+
                 raise RuntimeError(
                     "Linear constraint violation: "
                     f"{linear_violation:.3e}"
@@ -1126,6 +1177,11 @@ def main():
     )
 
     parser.add_argument("--show-plots", action="store_true")
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print detailed diagnostics when linear constraints fail.",
+    )
     parser.add_argument("--no-animation", action="store_true")
     parser.add_argument(
         "--animation-speed", type=float, default=2.0,

@@ -294,6 +294,10 @@ def run(args):
             title="KINOVA COLLISION OPTIMIZATION",
         )
 
+    elif not args.no_plots:
+        # Keep figures open when animation is disabled.
+        plt.show()
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)

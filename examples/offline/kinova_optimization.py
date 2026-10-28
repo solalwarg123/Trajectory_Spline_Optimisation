@@ -46,6 +46,7 @@ def solve_method(name, problem, initial_controls, args):
             damping_mode="adaptive",
             damping=1e-3,
             max_iterations=args.gn_iters,
+            max_damping_retries=args.gn_damping_retries,
         )
 
     elif name == "ipopt":
@@ -272,7 +273,13 @@ def main():
         "--gn-iters", type=int, default=20,
     )
     parser.add_argument(
-        "--ipopt-iters", type=int, default=200,
+        "--gn-damping-retries",
+        type=int,
+        default=2,
+        help="Maximum damping retries per Gauss-Newton iteration.",
+    )
+    parser.add_argument(
+        "--ipopt-iters", type=int, default=500,
     )
     parser.add_argument(
         "--control-points", type=int, default=30,

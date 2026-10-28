@@ -277,7 +277,11 @@ def plot_joint_quantities(times, results):
         fig, axes = plt.subplots(
             7, 1, figsize=(13, 15), sharex=True
         )
-        fig.suptitle(f"Joint {title.lower()} comparison", fontsize=14)
+        fig.suptitle(
+            f"Joint {title.lower()} comparison",
+            fontsize=14,
+            y=0.99,
+        )
 
         for j, ax in enumerate(axes):
             if np.isfinite(low[j]) and np.isfinite(high[j]):
@@ -302,7 +306,7 @@ def plot_joint_quantities(times, results):
 
         axes[0].legend(ncol=min(5, len(results)), fontsize=8)
         axes[-1].set_xlabel("Time [s]")
-        fig.tight_layout()
+        fig.tight_layout(rect=(0, 0, 1, 0.94))
 
 
 def plot_feasibility_usage(times, results):

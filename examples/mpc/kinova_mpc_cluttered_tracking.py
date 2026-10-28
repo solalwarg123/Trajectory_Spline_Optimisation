@@ -1618,11 +1618,11 @@ def main():
     )
     parser.add_argument(
         "--nominal-clearance-min",
-        type=float, default=0.03,
+        type=float, default=0.023,
     )
     parser.add_argument(
         "--nominal-clearance-max",
-        type=float, default=0.05,
+        type=float, default=0.028,
     )
     parser.add_argument(
         "--nominal-feasibility-buffer",
