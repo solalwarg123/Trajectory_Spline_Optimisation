@@ -395,3 +395,69 @@ def test_joint_trajectory_unwrap(robot):
         theta_ref,
         atol=1e-10,
     )
+
+
+def test_frame_kinematics_matches_individual_calls(robot):
+    q = robot.integrate(
+        robot.neutral(),
+        np.array([0.2, -0.1, 0.15, 0.1, -0.2, 0.1, 0.05]),
+    )
+
+    frames = ["end_effector_link", "end_effector_link"]
+    result = robot.frame_kinematics(q, frames)
+
+    assert list(result) == ["end_effector_link"]
+
+    position, jacobian = result["end_effector_link"]
+
+    np.testing.assert_allclose(
+        position,
+        robot.frame_position(q),
+        atol=1e-10,
+    )
+
+    np.testing.assert_allclose(
+        jacobian,
+        robot.frame_jacobian(q),
+        atol=1e-10,
+    )
+
+    assert position.shape == (3,)
+    assert jacobian.shape == (6, robot.nv)
+
+
+@pytest.mark.parametrize("invalid_value", [np.nan, np.inf, -np.inf])
+def test_rejects_nonfinite_configuration(robot, invalid_value):
+    q = robot.neutral()
+    q[0] = invalid_value
+
+    with pytest.raises(ValueError, match="finite"):
+        robot.frame_pose(q)
+
+
+@pytest.mark.parametrize("invalid_value", [np.nan, np.inf, -np.inf])
+def test_rejects_nonfinite_velocity(robot, invalid_value):
+    q = robot.neutral()
+    v = np.zeros(robot.nv)
+    v[0] = invalid_value
+
+    with pytest.raises(ValueError, match="finite"):
+        robot.integrate(q, v)
+
+
+def test_empty_trajectory_conversions(robot):
+    theta_empty = np.empty((0, robot.nv))
+
+    q_empty = robot.joint_trajectory_to_configurations(
+        theta_empty
+    )
+
+    assert q_empty.shape == (0, robot.nq)
+
+    theta_reconstructed = (
+        robot.configuration_trajectory_to_joint_positions(
+            q_empty
+        )
+    )
+
+    assert theta_reconstructed.shape == (0, robot.nv)

@@ -1,7 +1,9 @@
 import numpy as np
 
 from splineopt.bspline import BSpline
-from splineopt.optimizer import JointTrajectoryOptimizer
+from splineopt.joint_optimizer import JointTrajectoryOptimizer
+
+import pytest
 
 
 def make_test_spline():
@@ -442,3 +444,76 @@ def test_aggressive_reference_respects_constraints():
     )
 
     assert rms_tracking_error > 1e-3
+
+
+def test_optional_boundary_conditions():
+    spline = make_test_spline()
+    optimizer = JointTrajectoryOptimizer(
+        spline=spline,
+        lambda_smooth=1e-2,
+    )
+
+    tracking_times = np.linspace(
+        spline.t_start, spline.t_end, 30
+    )
+    q_ref = np.full((len(tracking_times), 1), 0.2)
+
+    a0 = np.array([0.0])
+    vf = np.array([0.0])
+
+    control_points, result = optimizer.solve(
+        tracking_times=tracking_times,
+        q_ref=q_ref,
+        q0=np.array([0.0]),
+        v0=np.array([0.0]),
+        a0=a0,
+        vf=vf,
+        q_min=np.array([-1.0]),
+        q_max=np.array([1.0]),
+        v_min=np.array([-2.0]),
+        v_max=np.array([2.0]),
+        a_min=np.array([-5.0]),
+        a_max=np.array([5.0]),
+    )
+
+    assert result.info.status.lower().startswith("solved")
+
+    np.testing.assert_allclose(
+        spline.acceleration(control_points, spline.t_start),
+        a0,
+        atol=1e-5,
+    )
+
+    np.testing.assert_allclose(
+        spline.velocity(control_points, spline.t_end),
+        vf,
+        atol=1e-5,
+    )
+
+
+def test_infeasible_joint_qp():
+    spline = make_test_spline()
+    optimizer = JointTrajectoryOptimizer(
+        spline=spline,
+        lambda_smooth=1e-2,
+    )
+
+    tracking_times = np.linspace(
+        spline.t_start, spline.t_end, 20
+    )
+    q_ref = np.zeros((len(tracking_times), 1))
+
+    # Initial position is incompatible with joint position bounds.
+    with pytest.raises(RuntimeError, match="OSQP failed"):
+        optimizer.solve(
+            tracking_times=tracking_times,
+            q_ref=q_ref,
+            q0=np.array([2.0]),
+            v0=np.array([0.0]),
+            q_min=np.array([-1.0]),
+            q_max=np.array([1.0]),
+            v_min=np.array([-2.0]),
+            v_max=np.array([2.0]),
+            a_min=np.array([-5.0]),
+            a_max=np.array([5.0]),
+        )

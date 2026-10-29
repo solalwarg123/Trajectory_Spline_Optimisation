@@ -20,7 +20,6 @@ from dataclasses import dataclass
 import numpy as np
 import scipy.sparse as sp
 
-
 # =====================================================================
 # Collision primitives
 # =====================================================================
@@ -52,35 +51,34 @@ class Capsule:
 
     def __post_init__(self):
         if not self.name:
-            raise ValueError(
-                "Capsule name must not be empty."
-            )
+            raise ValueError("Capsule name must not be empty.")
 
         if not self.start_frame:
-            raise ValueError(
-                "start_frame must not be empty."
-            )
+            raise ValueError("start_frame must not be empty.")
 
         if not self.end_frame:
-            raise ValueError(
-                "end_frame must not be empty."
-            )
+            raise ValueError("end_frame must not be empty.")
 
         if self.start_frame == self.end_frame:
-            raise ValueError(
-                "Capsule endpoints must use "
-                "different frames."
-            )
+            raise ValueError("Capsule endpoints must use " "different frames.")
 
-        if self.radius <= 0.0:
-            raise ValueError(
-                "Capsule radius must be positive."
-            )
+        if not np.isfinite(self.radius) or self.radius <= 0.0:
+            raise ValueError("Capsule radius must be finite and positive.")
 
 
 @dataclass(frozen=True)
 class SphereObstacle:
-    """Static spherical obstacle."""
+    """
+    Static spherical obstacle in the world frame.
+
+    Attributes:
+        center: Sphere center in world coordinates, shape (3,).
+        radius: Sphere radius in meters.
+        name: Optional identifier used in collision diagnostics.
+
+    The center is converted to a NumPy array and copied during
+    initialization.
+    """
 
     center: np.ndarray
     radius: float
@@ -93,21 +91,13 @@ class SphereObstacle:
         ).reshape(-1)
 
         if center.shape != (3,):
-            raise ValueError(
-                "SphereObstacle.center must have "
-                "shape (3,)."
-            )
+            raise ValueError("SphereObstacle.center must have " "shape (3,).")
 
         if not np.all(np.isfinite(center)):
-            raise ValueError(
-                "SphereObstacle.center must contain "
-                "finite values."
-            )
+            raise ValueError("SphereObstacle.center must contain " "finite values.")
 
-        if self.radius <= 0.0:
-            raise ValueError(
-                "SphereObstacle radius must be positive."
-            )
+        if not np.isfinite(self.radius) or self.radius <= 0.0:
+            raise ValueError("SphereObstacle radius must be finite and positive.")
 
         # Dataclass is frozen, so use object.__setattr__.
         object.__setattr__(
@@ -159,19 +149,12 @@ def _closest_point_on_segment(
 
     direction = b - a
 
-    length_squared = float(
-        direction @ direction
-    )
+    length_squared = float(direction @ direction)
 
     if length_squared <= 1e-16:
-        raise ValueError(
-            "Capsule axis has essentially zero length."
-        )
+        raise ValueError("Capsule axis has essentially zero length.")
 
-    alpha = float(
-        (point - a) @ direction
-        / length_squared
-    )
+    alpha = float((point - a) @ direction / length_squared)
 
     alpha = float(
         np.clip(
@@ -181,10 +164,7 @@ def _closest_point_on_segment(
         )
     )
 
-    closest = (
-        (1.0 - alpha) * a
-        + alpha * b
-    )
+    closest = (1.0 - alpha) * a + alpha * b
 
     return closest, alpha
 
@@ -205,9 +185,7 @@ def _fallback_normal(axis):
     axis_norm = np.linalg.norm(axis)
 
     if axis_norm <= 1e-16:
-        return np.array(
-            [1.0, 0.0, 0.0]
-        )
+        return np.array([1.0, 0.0, 0.0])
 
     axis = axis / axis_norm
 
@@ -215,25 +193,17 @@ def _fallback_normal(axis):
 
     # Choose the coordinate direction least aligned
     # with the capsule axis.
-    index = int(
-        np.argmin(
-            np.abs(axis)
-        )
-    )
+    index = int(np.argmin(np.abs(axis)))
 
     normal = np.cross(
         axis,
         basis_vectors[index],
     )
 
-    normal_norm = np.linalg.norm(
-        normal
-    )
+    normal_norm = np.linalg.norm(normal)
 
     if normal_norm <= 1e-16:
-        raise RuntimeError(
-            "Could not construct a fallback normal."
-        )
+        raise RuntimeError("Could not construct a fallback normal.")
 
     return normal / normal_norm
 
@@ -286,37 +256,24 @@ def capsule_sphere_distance(
         dtype=float,
     ).reshape(3)
 
-    closest, alpha = (
-        _closest_point_on_segment(
-            point=center,
-            segment_start=a,
-            segment_end=b,
-        )
+    closest, alpha = _closest_point_on_segment(
+        point=center,
+        segment_start=a,
+        segment_end=b,
     )
 
     delta = closest - center
 
-    centerline_distance = float(
-        np.linalg.norm(delta)
-    )
+    centerline_distance = float(np.linalg.norm(delta))
 
     if centerline_distance > 1e-12:
-        normal = (
-            delta
-            / centerline_distance
-        )
+        normal = delta / centerline_distance
     else:
         # The distance function is non-differentiable here.
         # Use one deterministic subgradient direction.
-        normal = _fallback_normal(
-            b - a
-        )
+        normal = _fallback_normal(b - a)
 
-    signed_distance = (
-        centerline_distance
-        - float(capsule_radius)
-        - float(sphere_radius)
-    )
+    signed_distance = centerline_distance - float(capsule_radius) - float(sphere_radius)
 
     return (
         signed_distance,
@@ -348,15 +305,9 @@ class CollisionEnvironment:
     ):
         self.robot = robot
 
-        self.capsules = list(
-            capsules
-        )
+        self.capsules = list(capsules)
 
-        self.obstacles = (
-            []
-            if obstacles is None
-            else list(obstacles)
-        )
+        self.obstacles = [] if obstacles is None else list(obstacles)
 
         self._validate()
 
@@ -365,34 +316,25 @@ class CollisionEnvironment:
     # -----------------------------------------------------------------
 
     def _validate(self):
+        """Validate spline compatibility, safety distance and collocation times."""
         for capsule in self.capsules:
             if not isinstance(
                 capsule,
                 Capsule,
             ):
-                raise TypeError(
-                    "capsules must contain "
-                    "Capsule objects."
-                )
+                raise TypeError("capsules must contain " "Capsule objects.")
 
             # Fail early if a frame name is invalid.
-            self.robot.frame_id(
-                capsule.start_frame
-            )
+            self.robot.frame_id(capsule.start_frame)
 
-            self.robot.frame_id(
-                capsule.end_frame
-            )
+            self.robot.frame_id(capsule.end_frame)
 
         for obstacle in self.obstacles:
             if not isinstance(
                 obstacle,
                 SphereObstacle,
             ):
-                raise TypeError(
-                    "obstacles must contain "
-                    "SphereObstacle objects."
-                )
+                raise TypeError("obstacles must contain " "SphereObstacle objects.")
 
     # -----------------------------------------------------------------
     # Basic information
@@ -400,28 +342,19 @@ class CollisionEnvironment:
 
     @property
     def n_capsules(self):
-        return len(
-            self.capsules
-        )
+        return len(self.capsules)
 
     @property
     def n_obstacles(self):
-        return len(
-            self.obstacles
-        )
+        return len(self.obstacles)
 
     @property
     def n_pairs(self):
-        return (
-            self.n_capsules
-            * self.n_obstacles
-        )
+        return self.n_capsules * self.n_obstacles
 
     @property
     def has_obstacles(self):
-        return (
-            self.n_obstacles > 0
-        )
+        return self.n_obstacles > 0
 
     def pair_names(self):
         """Human-readable names for all collision pairs."""
@@ -429,14 +362,8 @@ class CollisionEnvironment:
         names = []
 
         for capsule in self.capsules:
-            for j, obstacle in enumerate(
-                self.obstacles
-            ):
-                obstacle_name = (
-                    obstacle.name
-                    if obstacle.name
-                    else f"obstacle_{j}"
-                )
+            for j, obstacle in enumerate(self.obstacles):
+                obstacle_name = obstacle.name if obstacle.name else f"obstacle_{j}"
 
                 names.append(
                     (
@@ -484,13 +411,9 @@ class CollisionEnvironment:
             dtype=float,
         ).reshape(-1)
 
-        if theta.shape != (
-            self.robot.nv,
-        ):
+        if theta.shape != (self.robot.nv,):
             raise ValueError(
-                f"Expected theta shape "
-                f"({self.robot.nv},), "
-                f"got {theta.shape}."
+                f"Expected theta shape " f"({self.robot.nv},), " f"got {theta.shape}."
             )
 
         # -------------------------------------------------------------
@@ -523,12 +446,7 @@ class CollisionEnvironment:
         # Convert spline joint coordinates to Pinocchio configuration
         # -------------------------------------------------------------
 
-        q_pin = (
-            self.robot
-            .joint_positions_to_configuration(
-                theta
-            )
-        )
+        q_pin = self.robot.joint_positions_to_configuration(theta)
 
         # -------------------------------------------------------------
         # Compute endpoint positions and Jacobians
@@ -541,33 +459,22 @@ class CollisionEnvironment:
         frame_names = set()
 
         for capsule in self.capsules:
-            frame_names.add(
-                capsule.start_frame
-            )
-            frame_names.add(
-                capsule.end_frame
-            )
+            frame_names.add(capsule.start_frame)
+            frame_names.add(capsule.end_frame)
 
-        kinematics = (
-            self.robot.frame_kinematics(
-                q_pin,
-                frame_names,
-            )
+        kinematics = self.robot.frame_kinematics(
+            q_pin,
+            frame_names,
         )
 
         positions = {
-            frame_name: kinematics[
-                frame_name
-            ][0]
-            for frame_name in frame_names
+            frame_name: kinematics[frame_name][0] for frame_name in frame_names
         }
 
         if compute_jacobian:
 
             jacobians = {
-                frame_name: kinematics[
-                    frame_name
-                ][1][:3, :].copy()
+                frame_name: kinematics[frame_name][1][:3, :].copy()
                 for frame_name in frame_names
             }
 
@@ -599,22 +506,14 @@ class CollisionEnvironment:
 
         for capsule in self.capsules:
 
-            p0 = positions[
-                capsule.start_frame
-            ]
+            p0 = positions[capsule.start_frame]
 
-            p1 = positions[
-                capsule.end_frame
-            ]
+            p1 = positions[capsule.end_frame]
 
             if compute_jacobian:
-                J0 = jacobians[
-                    capsule.start_frame
-                ]
+                J0 = jacobians[capsule.start_frame]
 
-                J1 = jacobians[
-                    capsule.end_frame
-                ]
+                J1 = jacobians[capsule.end_frame]
 
             for obstacle in self.obstacles:
 
@@ -626,20 +525,12 @@ class CollisionEnvironment:
                 ) = capsule_sphere_distance(
                     segment_start=p0,
                     segment_end=p1,
-                    capsule_radius=(
-                        capsule.radius
-                    ),
-                    sphere_center=(
-                        obstacle.center
-                    ),
-                    sphere_radius=(
-                        obstacle.radius
-                    ),
+                    capsule_radius=(capsule.radius),
+                    sphere_center=(obstacle.center),
+                    sphere_radius=(obstacle.radius),
                 )
 
-                distances_out[row] = (
-                    distance
-                )
+                distances_out[row] = distance
 
                 if compute_jacobian:
                     # Closest point:
@@ -651,15 +542,9 @@ class CollisionEnvironment:
                     # Locally, the derivative of the minimum
                     # distance can be evaluated at the active
                     # closest point without differentiating alpha.
-                    J_closest = (
-                        (1.0 - alpha) * J0
-                        + alpha * J1
-                    )
+                    J_closest = (1.0 - alpha) * J0 + alpha * J1
 
-                    jacobians_out[row] = (
-                        normal
-                        @ J_closest
-                    )
+                    jacobians_out[row] = normal @ J_closest
 
                 row += 1
 
@@ -675,25 +560,36 @@ class CollisionEnvironment:
 
 
 class CollisionConstraintBuilder:
-    """Build linearized collision constraints for a B-spline trajectory.
+    """
+    Build sampled collision constraints for a B-spline trajectory.
 
-    At SQP / Gauss-Newton iteration s:
+    The robot is approximated by capsules and the environment by
+    static spherical obstacles. Signed distances are evaluated at
+    specified collocation times along the trajectory.
 
-        q_i = A_i c_s
+    At a linearization point c_s, the joint configuration is:
 
-    and
+        q_i = A_i @ c_s
 
-        d(q_i)
-            ~= d_i
-             + J_d,i A_i (c - c_s).
+    The signed distance is approximated to first order:
 
-    The safety constraint
+        d(A_i @ c) ~= d_i + J_d,i @ A_i @ (c - c_s)
 
-        d(q_i) >= safety_distance
+    Imposing a minimum safety distance gives:
 
-    becomes
+        H_i @ c >= h_i
 
-        H_i c >= h_i.
+    where:
+        H_i = J_d,i @ A_i
+        h_i = safety_distance - d_i + H_i @ c_s
+
+    The builder provides exact sampled distances, analytical
+    Jacobians, linearized constraints and feasibility checks.
+
+    Important:
+        Collision constraints are enforced only at collocation
+        times. They do not guarantee continuous-time collision
+        avoidance between samples.
     """
 
     def __init__(
@@ -705,25 +601,18 @@ class CollisionConstraintBuilder:
         safety_distance=0.0,
     ):
         self.spline = spline
-        self.environment = (
-            environment
-        )
+        self.environment = environment
 
         self.collocation_times = np.asarray(
             collocation_times,
             dtype=float,
         ).reshape(-1)
 
-        self.safety_distance = float(
-            safety_distance
-        )
+        self.safety_distance = float(safety_distance)
 
         self._validate()
 
-        self.n_variables = (
-            self.spline.n_control_points
-            * self.spline.n_dof
-        )
+        self.n_variables = self.spline.n_control_points * self.spline.n_dof
 
         # One evaluation matrix per collocation point.
         self.A_collocation = [
@@ -734,68 +623,31 @@ class CollisionConstraintBuilder:
             for t in self.collocation_times
         ]
 
-        # Global matrix:
-        #
-        # Q_col = A_col c
-        if len(
-            self.A_collocation
-        ) > 0:
-            self.A_col = np.vstack(
-                self.A_collocation
-            )
-        else:
-            self.A_col = np.empty(
-                (
-                    0,
-                    self.n_variables,
-                )
-            )
-
     # -----------------------------------------------------------------
     # Validation
     # -----------------------------------------------------------------
 
     def _validate(self):
-        if (
-            self.spline.n_dof
-            != self.environment.robot.nv
+        if self.spline.n_dof != self.environment.robot.nv:
+            raise ValueError("spline.n_dof must match " "environment.robot.nv.")
+
+        if not np.isfinite(self.safety_distance) or self.safety_distance < 0.0:
+            raise ValueError("safety_distance must be finite and non-negative.")
+
+        if not np.all(np.isfinite(self.collocation_times)):
+            raise ValueError("collocation_times must contain only finite values.")
+
+        if np.any(self.collocation_times < self.spline.t_start) or np.any(
+            self.collocation_times > self.spline.t_end
         ):
             raise ValueError(
-                "spline.n_dof must match "
-                "environment.robot.nv."
+                "All collision collocation times " "must lie inside the spline domain."
             )
 
-        if self.safety_distance < 0.0:
-            raise ValueError(
-                "safety_distance must be "
-                "non-negative."
-            )
-
-        if np.any(
-            self.collocation_times
-            < self.spline.t_start
-        ) or np.any(
-            self.collocation_times
-            > self.spline.t_end
+        if self.collocation_times.size > 1 and np.any(
+            np.diff(self.collocation_times) <= 0.0
         ):
-            raise ValueError(
-                "All collision collocation times "
-                "must lie inside the spline domain."
-            )
-
-        if (
-            self.collocation_times.size > 1
-            and np.any(
-                np.diff(
-                    self.collocation_times
-                )
-                <= 0.0
-            )
-        ):
-            raise ValueError(
-                "collocation_times must be "
-                "strictly increasing."
-            )
+            raise ValueError("collocation_times must be " "strictly increasing.")
 
     # -----------------------------------------------------------------
     # Basic information
@@ -807,16 +659,11 @@ class CollisionConstraintBuilder:
 
     @property
     def n_constraints(self):
-        return (
-            self.n_collocation_points
-            * self.environment.n_pairs
-        )
+        return self.n_collocation_points * self.environment.n_pairs
 
     @property
     def has_constraints(self):
-        return (
-            self.n_constraints > 0
-        )
+        return self.n_constraints > 0
 
     # -----------------------------------------------------------------
     # True nonlinear distances
@@ -848,13 +695,12 @@ class CollisionConstraintBuilder:
                 f"got {c.size}."
             )
 
-        n_col = (
-            self.n_collocation_points
-        )
+        if not np.all(np.isfinite(c)):
+            raise ValueError("Control points must be finite.")
 
-        n_pairs = (
-            self.environment.n_pairs
-        )
+        n_col = self.n_collocation_points
+
+        n_pairs = self.environment.n_pairs
 
         if n_pairs == 0:
             return np.empty(
@@ -873,16 +719,12 @@ class CollisionConstraintBuilder:
             dtype=float,
         )
 
-        for i, A_i in enumerate(
-            self.A_collocation
-        ):
+        for i, A_i in enumerate(self.A_collocation):
             theta_i = A_i @ c
 
-            d_i, _ = (
-                self.environment.evaluate(
-                    theta_i,
-                    compute_jacobian=False,
-                )
+            d_i, _ = self.environment.evaluate(
+                theta_i,
+                compute_jacobian=False,
             )
 
             distances[i] = d_i
@@ -898,13 +740,7 @@ class CollisionConstraintBuilder:
         if not self.has_constraints:
             return np.inf
 
-        return float(
-            np.min(
-                self.distances(
-                    control_points
-                )
-            )
-        )
+        return float(np.min(self.distances(control_points)))
 
     def is_feasible(
         self,
@@ -912,19 +748,32 @@ class CollisionConstraintBuilder:
         *,
         tolerance=1e-9,
     ):
-        """Check true nonlinear collision feasibility."""
+        """
+        Check sampled nonlinear collision feasibility.
+
+        A trajectory is feasible if every sampled signed distance
+        satisfies:
+
+            distance >= safety_distance - tolerance
+
+        Args:
+            control_points: B-spline control points.
+            tolerance: Allowed numerical violation in meters.
+
+        Returns:
+            True if all sampled collision constraints are satisfied.
+            Also returns True when no collision constraints exist.
+
+        Note:
+            This check does not guarantee collision avoidance
+            between collocation times.
+        """
 
         if not self.has_constraints:
             return True
 
-        return (
-            self.minimum_distance(
-                control_points
-            )
-            >= (
-                self.safety_distance
-                - float(tolerance)
-            )
+        return self.minimum_distance(control_points) >= (
+            self.safety_distance - float(tolerance)
         )
 
     # -----------------------------------------------------------------
@@ -936,11 +785,29 @@ class CollisionConstraintBuilder:
         control_points,
     ):
         """
-        Linearize collision constraints around the current trajectory.
+        Linearize the collision constraints around control_points.
 
-        Returns
+        For the current trajectory c_s, the signed distances are
+        approximated by their first-order Taylor expansion:
 
-            H c_new >= h
+            d(c) ~= d(c_s) + H @ (c - c_s)
+
+        The safety constraints become:
+
+            H @ c >= h
+
+        with:
+            h = safety_distance - d(c_s) + H @ c_s
+
+        Args:
+            control_points: Current B-spline control points.
+
+        Returns:
+            H: Sparse constraint Jacobian of shape
+            (n_constraints, n_variables).
+            h: Lower bounds of shape (n_constraints,).
+
+        If no collision constraints exist, empty arrays are returned.
         """
 
         c = np.asarray(
@@ -948,11 +815,7 @@ class CollisionConstraintBuilder:
             dtype=float,
         ).reshape(-1)
 
-        distances, H = (
-            self.values_and_jacobian(
-                c
-            )
-        )
+        distances, H = self.values_and_jacobian(c)
 
         if distances.size == 0:
             return (
@@ -963,13 +826,7 @@ class CollisionConstraintBuilder:
                 ),
             )
 
-        h = (
-            self.safety_distance
-            - distances
-            + np.asarray(
-                H @ c
-            ).reshape(-1)
-        )
+        h = self.safety_distance - distances + np.asarray(H @ c).reshape(-1)
 
         return H, h
 
@@ -1005,6 +862,9 @@ class CollisionConstraintBuilder:
                 f"got {c.size}."
             )
 
+        if not np.all(np.isfinite(c)):
+            raise ValueError("Control points must be finite.")
+
         if not self.has_constraints:
             return (
                 np.empty(
@@ -1024,15 +884,11 @@ class CollisionConstraintBuilder:
 
         for A_i in self.A_collocation:
 
-            theta_i = (
-                A_i @ c
-            )
+            theta_i = A_i @ c
 
-            distances_i, J_distance_i = (
-                self.environment.evaluate(
-                    theta_i,
-                    compute_jacobian=True,
-                )
+            distances_i, J_distance_i = self.environment.evaluate(
+                theta_i,
+                compute_jacobian=True,
             )
 
             # J_distance_i:
@@ -1050,24 +906,13 @@ class CollisionConstraintBuilder:
             # gives:
             #
             #     n_pairs x n_variables
-            J_control_i = (
-                J_distance_i
-                @ A_i
-            )
+            J_control_i = J_distance_i @ A_i
 
-            values.append(
-                distances_i
-            )
+            values.append(distances_i)
 
-            jacobian_rows.append(
-                sp.csc_matrix(
-                    J_control_i
-                )
-            )
+            jacobian_rows.append(sp.csc_matrix(J_control_i))
 
-        values = np.concatenate(
-            values
-        )
+        values = np.concatenate(values)
 
         jacobian = sp.vstack(
             jacobian_rows,
@@ -1096,14 +941,10 @@ class CollisionConstraintBuilder:
         continuous collision certificate.
         """
         if not np.isfinite(activation_distance):
-            raise ValueError(
-                "activation_distance must be finite."
-            )
+            raise ValueError("activation_distance must be finite.")
 
         if activation_distance < 0.0:
-            raise ValueError(
-                "activation_distance must be non-negative."
-            )
+            raise ValueError("activation_distance must be non-negative.")
 
         if n_samples < 2:
             raise ValueError("n_samples must be >= 2.")
@@ -1114,19 +955,13 @@ class CollisionConstraintBuilder:
         if n_obs == 0:
             return ()
 
-        c = np.asarray(
-            control_points, dtype=float
-        ).reshape(-1)
+        c = np.asarray(control_points, dtype=float).reshape(-1)
 
         if c.size != self.n_variables:
-            raise ValueError(
-                "Invalid control point vector size."
-            )
+            raise ValueError("Invalid control point vector size.")
 
         if not np.all(np.isfinite(c)):
-            raise ValueError(
-                "Control points must be finite."
-            )
+            raise ValueError("Control points must be finite.")
 
         active = np.zeros(n_obs, dtype=bool)
 
@@ -1137,21 +972,15 @@ class CollisionConstraintBuilder:
         )
 
         for t in times:
-            A = self.spline.evaluation_matrix(
-                t, derivative_order=0
-            )
+            A = self.spline.evaluation_matrix(t, derivative_order=0)
             q = A @ c
 
-            distances, _ = env.evaluate(
-                q, compute_jacobian=False
-            )
+            distances, _ = env.evaluate(q, compute_jacobian=False)
 
             # CollisionEnvironment orders pairs as:
             # capsule 0 / obstacle 0..N,
             # capsule 1 / obstacle 0..N, etc.
-            distances = distances.reshape(
-                env.n_capsules, n_obs
-            )
+            distances = distances.reshape(env.n_capsules, n_obs)
 
             active |= np.any(
                 distances <= activation_distance,
@@ -1176,19 +1005,13 @@ class CollisionConstraintBuilder:
         if len(indices) != len(set(indices)):
             raise ValueError("Duplicate obstacle indices.")
 
-        if any(
-            i < 0 or i >= self.environment.n_obstacles
-            for i in indices
-        ):
+        if any(i < 0 or i >= self.environment.n_obstacles for i in indices):
             raise ValueError("Invalid obstacle index.")
 
         environment = CollisionEnvironment(
             robot=self.environment.robot,
             capsules=self.environment.capsules,
-            obstacles=[
-                self.environment.obstacles[i]
-                for i in indices
-            ],
+            obstacles=[self.environment.obstacles[i] for i in indices],
         )
 
         return CollisionConstraintBuilder(

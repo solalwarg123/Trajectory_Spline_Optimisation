@@ -215,6 +215,13 @@ def test_ik_history(robot):
         <
         result.error_history[0]
     )
+    assert len(result.q_history) == result.iterations + 1
+    assert len(result.error_history) == result.iterations + 1
+
+    np.testing.assert_allclose(
+        result.q_history[-1],
+        result.q,
+    )
 
 
 def test_ik_trajectory(robot):
@@ -299,3 +306,100 @@ def test_ik_trajectory(robot):
         ).vector
 
         assert np.linalg.norm(error) < 1e-5
+
+
+def test_ik_non_convergence(robot):
+    q_start = make_non_singular_configuration(robot)
+
+    delta = np.zeros(robot.nv)
+    delta[0] = 0.2
+    delta[1] = -0.2
+
+    q_target = robot.integrate(q_start, delta)
+    target_pose = robot.frame_pose(q_target)
+
+    result = robot.ik(
+        target_pose,
+        q0=q_start,
+        tolerance=1e-8,
+        max_iterations=0,
+    )
+
+    assert not result.success
+    assert result.iterations == 0
+    assert result.error_norm > 1e-8
+
+    assert result.q_history.shape == (1, robot.nq)
+    assert result.error_history.shape == (1,)
+
+    np.testing.assert_allclose(result.q, q_start)
+
+
+def test_ik_trajectory_failure_handling(robot):
+    q_start = make_non_singular_configuration(robot)
+
+    delta = np.zeros(robot.nv)
+    delta[0] = 0.2
+    delta[1] = -0.2
+
+    q_target = robot.integrate(q_start, delta)
+
+    targets = [
+        robot.frame_pose(q_start),
+        robot.frame_pose(q_target),
+    ]
+
+    # Continue and report the unsuccessful solve.
+    result = robot.ik_trajectory(
+        targets,
+        q0=q_start,
+        max_iterations=0,
+        tolerance=1e-8,
+        stop_on_failure=False,
+    )
+
+    assert not result.success
+    np.testing.assert_array_equal(
+        result.success_mask,
+        [True, False],
+    )
+    assert result.q_pin.shape == (2, robot.nq)
+    assert result.theta.shape == (2, robot.nv)
+    assert len(result.results) == 2
+
+    # Alternatively, stop immediately on failure.
+    with pytest.raises(
+        RuntimeError,
+        match="IK failed at trajectory sample 1",
+    ):
+        robot.ik_trajectory(
+            targets,
+            q0=q_start,
+            max_iterations=0,
+            tolerance=1e-8,
+            stop_on_failure=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"tolerance": 0.0},
+        {"tolerance": np.nan},
+        {"max_iterations": -1},
+        {"max_iterations": 2.5},
+        {"step_size": 0.0},
+        {"step_size": np.inf},
+        {"damping": -1.0},
+        {"damping": 0.0},
+        {"max_step_norm": 0.0},
+    ],
+)
+def test_ik_rejects_invalid_parameters(robot, kwargs):
+    target_pose = robot.frame_pose(robot.neutral())
+
+    with pytest.raises(ValueError):
+        robot.ik(
+            target_pose,
+            **kwargs,
+        )

@@ -1,3 +1,23 @@
+
+"""
+B-spline trajectory representation and analytical matrix construction.
+
+This module provides the mathematical foundation for trajectory
+optimization in joint space. It represents multi-dimensional
+trajectories using B-spline control points and constructs the
+matrices needed to evaluate and constrain their derivatives.
+
+Main features:
+    - Local polynomial basis construction using Cox-de Boor recursion.
+    - Trajectory evaluation and analytical time derivatives.
+    - Control-point selection and derivative transformation matrices.
+    - Exact quadratic smoothness matrices.
+    - Caching of reusable matrices.
+
+The module is independent of robot kinematics and optimization solvers.
+"""
+
+
 import numpy as np
 from math import factorial
 
@@ -61,20 +81,51 @@ def derivative_gram_matrix(degree, derivative_order=0):
 
 class BSpline:
     """
-    B-spline trajectory representation.
+    Multi-dimensional B-spline trajectory representation.
 
-    The control points are stacked as
+    A trajectory q(t) is defined by a knot vector, a polynomial
+    degree p, and Nc control points of dimension n_dof.
 
-        c = [c_0^T, ..., c_{Nc-1}^T]^T
+    Control points are stacked into a single vector:
 
-    with c_i in R^(n_dof).
+        c = [c_0^T, c_1^T, ..., c_(Nc-1)^T]^T
 
-    The trajectory and its derivatives satisfy
+    The trajectory and its time derivatives are linear in c:
 
-        q^(r)(t) = A^(r)(t) c.
+        q^(r)(t) = A^(r)(t) @ c
+
+    On each non-empty knot span k, the evaluation matrix is:
+
+        A^(r)(t) = Delta_k^(-r)
+                   (Gamma_p^(r)(s) @ M_k kron I) @ S_k
+
+    where:
+        - s is the normalized local time in [0, 1].
+        - M_k is the local polynomial basis matrix.
+        - S_k selects the active control points.
+        - Delta_k is the knot-span duration.
+
+    The class also provides derivative control-point matrices
+    and exact quadratic smoothness matrices:
+
+        integral ||q^(r)(t)||^2 dt = c.T @ R_r @ c
+
+    All matrices depending only on the spline structure are cached.
+    Control points are supplied separately when evaluating a trajectory.
     """
 
     def __init__(self, knots, degree, n_dof):
+        """
+        Initialize a B-spline trajectory representation.
+
+        Args:
+            knots: Non-decreasing knot vector of length Nc + degree + 1.
+            degree: Polynomial degree p.
+            n_dof: Number of trajectory dimensions.
+
+        Control points are stored externally and are not required
+        to construct the spline.
+        """
 
         self.knots = np.asarray(knots, dtype=float)
         self.degree = degree
@@ -119,6 +170,16 @@ class BSpline:
     # ========================================================
 
     def _validate(self):
+        """
+        Validate spline dimensions, degree and knot vector.
+
+        The knot vector must be one-dimensional, non-decreasing,
+        and contain enough knots for the requested degree.
+        The active time domain must have strictly positive length.
+
+        Raises:
+            ValueError: If the spline configuration is invalid.
+        """
 
         if self.knots.ndim != 1:
             raise ValueError("knots must be a 1D array.")
@@ -147,23 +208,43 @@ class BSpline:
                 "Not enough control points for this degree."
             )
 
+        if self.knots[self.degree] >= self.knots[n_control_points]:
+            raise ValueError(
+                "Spline time domain must have positive duration."
+            )
+
     # ========================================================
     # Domain
     # ========================================================
 
     @property
     def t_start(self):
+        """Return the start of the active spline time domain."""
         return self.knots[self.degree]
 
     @property
     def t_end(self):
+        """Return the end of the active spline time domain."""
         return self.knots[self.n_control_points]
 
     def segment(self, t):
         """
-        Return segment k such that
+        Return the knot-span index containing t.
 
-            t in [tau_{k+p}, tau_{k+p+1}].
+        Valid spans satisfy:
+            knots[k + degree] < knots[k + degree + 1]
+
+        The intervals are left-closed and right-open,
+        except that t_end belongs to the final span.
+
+        Args:
+            t: Time in [t_start, t_end].
+
+        Returns:
+            Index k of the active knot span.
+
+        Raises:
+            ValueError: If t is outside the spline domain.
         """
 
         if t < self.t_start or t > self.t_end:
@@ -173,7 +254,7 @@ class BSpline:
             )
 
         # Final point belongs to final segment
-        if np.isclose(t, self.t_end):
+        if t == self.t_end:
             return self.segments[-1]
 
         for k in self.segments:
@@ -190,13 +271,20 @@ class BSpline:
 
     def normalized_time(self, t, segment):
         """
-        Compute
+        Convert physical time to normalized local time.
 
-            Delta_k = tau_{k+p+1} - tau_{k+p}
+        For a non-empty knot span k:
 
-        and
+            delta = knots[k+p+1] - knots[k+p]
+            s = (t - knots[k+p]) / delta
 
-            s = (t - tau_{k+p}) / Delta_k.
+        Args:
+            t: Physical time.
+            segment: Index of a non-empty knot span.
+
+        Returns:
+            (s, delta), where s is dimensionless and delta
+            is the duration of the knot span.
         """
 
         t0 = self.knots[segment + self.degree]
@@ -213,9 +301,17 @@ class BSpline:
 
     def basis_matrix(self, segment):
         """
-        Return M_k.
+        Return the cached local polynomial basis matrix M_k.
 
-        The matrix is computed only once for each segment.
+        On knot span k, the active B-spline basis functions
+        are represented by:
+
+            [B_k,p(t), ..., B_k+p,p(t)] = Gamma_p(s) @ M_k
+
+        where s is the normalized local time.
+
+        Returns:
+            Matrix of shape (degree + 1, degree + 1).
         """
 
         if segment not in self._basis_matrix_cache:
@@ -355,11 +451,18 @@ class BSpline:
 
     def selection_matrix(self, segment):
         """
-        Return S_k such that
+        Return the cached local control-point selection matrix S_k.
 
-            c_{k:k+p} = S_k c.
+        The matrix extracts the degree + 1 consecutive control points
+        with indices k, k+1, ..., k+degree:
 
-        S_k is computed only once per segment.
+            c_local = S_k @ c
+
+        where c is the flattened global control-point vector.
+
+        Returns:
+            Matrix of shape
+            ((degree + 1) * n_dof, Nc * n_dof).
         """
 
         if segment not in self._selection_matrix_cache:
@@ -370,6 +473,16 @@ class BSpline:
         return self._selection_matrix_cache[segment]
 
     def _compute_selection_matrix(self, segment):
+        """
+        Construct the local control-point selection matrix S_k.
+
+        S_k extracts the degree + 1 consecutive control points
+        associated with a segment from the flattened global vector.
+
+        Returns:
+            Matrix of shape
+            ((degree + 1) * n_dof, n_control_points * n_dof).
+        """
 
         selector = np.zeros(
             (
@@ -415,6 +528,22 @@ class BSpline:
         ]
 
     def _compute_smoothness_matrix(self, derivative_order):
+        """
+        Assemble the exact quadratic smoothness matrix.
+
+        Each non-empty knot span contributes a local matrix
+        computed from the polynomial basis and derivative Gram
+        matrix, mapped to global control points through S_k.
+
+        Args:
+            derivative_order: Derivative order r to penalize.
+
+        Returns:
+            Symmetric matrix R_r of shape (Nc*n_dof, Nc*n_dof)
+            satisfying:
+
+                integral ||q^(r)(t)||^2 dt = c.T @ R_r @ c
+        """
 
         r = derivative_order
 
@@ -546,7 +675,17 @@ class BSpline:
         derivative_order=0,
     ):
         """
-        Evaluate q^(r)(t).
+        Evaluate the trajectory or one of its time derivatives.
+
+        Args:
+            control_points: Array of shape (Nc, n_dof), or
+                a flattened array of length Nc*n_dof.
+            t: Evaluation time in the active spline domain.
+            derivative_order: Time derivative order r (default 0).
+
+        Returns:
+            Array of shape (n_dof,) containing q^(r)(t).
+            Orders greater than the spline degree return zero.
         """
 
         c = np.asarray(
@@ -573,6 +712,7 @@ class BSpline:
         return A @ c
 
     def position(self, control_points, t):
+        """Evaluate the trajectory position q(t)."""
         return self.evaluate(
             control_points,
             t,
@@ -580,6 +720,7 @@ class BSpline:
         )
 
     def velocity(self, control_points, t):
+        """Evaluate the first time derivative q_dot(t)."""
         return self.evaluate(
             control_points,
             t,
@@ -587,6 +728,7 @@ class BSpline:
         )
 
     def acceleration(self, control_points, t):
+        """Evaluate the second time derivative q_ddot(t)."""
         return self.evaluate(
             control_points,
             t,
@@ -599,11 +741,21 @@ class BSpline:
 
     def derivative_control_matrix(self, order=1):
         """
-        Return D_r such that the derivative control points satisfy
+        Return the cached derivative control-point matrix D_r.
 
-            c^(r) = D_r c.
+        The control points of the r-th derivative spline satisfy:
 
-        The matrix is computed once for each derivative order.
+            c^(r) = D_r @ c
+
+        The derivative spline has degree p-r and Nc-r
+        control points.
+
+        Args:
+            order: Derivative order between 0 and degree.
+
+        Returns:
+            Matrix of shape
+            ((Nc-order)*n_dof, Nc*n_dof).
         """
 
         if order < 0:
@@ -630,7 +782,12 @@ class BSpline:
         order,
     ):
         """
-        Construct D_r recursively.
+        Construct D_r by composing successive derivative maps.
+
+        Each differentiation decreases the spline degree and
+        the number of control points by one. The resulting
+        scalar transformation is expanded across all trajectory
+        dimensions using a Kronecker product.
         """
 
         if order == 0:

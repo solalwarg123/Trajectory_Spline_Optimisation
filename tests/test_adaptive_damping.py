@@ -161,6 +161,20 @@ def test_adaptive_solver_reduces_objective():
     )
 
     assert final_cost < initial_cost
+    assert len(result.history) >= 1
+    assert len(result.history) == result.iterations
+
+    assert all(
+        np.isfinite(step.objective)
+        and np.isfinite(step.step_norm)
+        and 0.0 < step.alpha <= 1.0
+        for step in result.history
+    )
+
+    assert all(
+        step.osqp_status.lower().startswith("solved")
+        for step in result.history
+    )
 
 
 def test_adaptive_solver_converges_near_quadratic_optimum():
@@ -393,3 +407,108 @@ def test_static_damping_does_not_retry(
     assert damping_values[0] == pytest.approx(
         1e-3
     )
+
+
+def test_adaptive_damping_retry_limit(monkeypatch):
+    problem = SimpleQuadraticProblem()
+
+    solver = GaussNewtonSolver(
+        damping=1e-3,
+        damping_mode="adaptive",
+        damping_increase=2.0,
+        max_damping_retries=2,
+        max_iterations=5,
+    )
+
+    damping_values = []
+
+    def fake_gauss_newton_step(
+        problem,
+        current_control_points,
+        *,
+        damping=None,
+        verbose=False,
+    ):
+        damping_values.append(damping)
+
+        # Always propose a direction increasing the objective.
+        c_qp = np.array([-1.0])
+        P_model = np.array([[2.0]])
+        g_model = np.array([-2.0])
+
+        class FakeInfo:
+            status = "solved"
+            solve_time = 0.0
+
+        class FakeResult:
+            info = FakeInfo()
+
+        return c_qp, FakeResult(), P_model, g_model
+
+    monkeypatch.setattr(
+        solver,
+        "gauss_newton_step",
+        fake_gauss_newton_step,
+    )
+
+    initial = np.array([[0.0]])
+
+    result = solver.solve(
+        problem=problem,
+        initial_control_points=initial,
+    )
+
+    assert not result.success
+    assert result.status == "damping_limit"
+    assert result.iterations == 0
+    assert len(result.history) == 0
+
+    np.testing.assert_allclose(
+        result.control_points,
+        initial,
+    )
+
+    np.testing.assert_allclose(
+        damping_values,
+        [1e-3, 2e-3, 4e-3],
+    )
+
+
+@pytest.mark.parametrize(
+    "status, solution, expected_error",
+    [
+        ("primal infeasible", None, "Gauss-Newton QP failed"),
+        ("maximum iterations reached", None, "Gauss-Newton QP failed"),
+        ("solved", [], "OSQP returned fewer variables"),
+    ],
+)
+def test_gauss_newton_rejects_invalid_qp_result(
+    monkeypatch, status, solution, expected_error
+):
+    from types import SimpleNamespace
+    import splineopt.optimizer as optimizer_module
+
+    class FakeOSQP:
+        def setup(self, **kwargs):
+            pass
+
+        def solve(self):
+            return SimpleNamespace(
+                info=SimpleNamespace(status=status),
+                x=solution,
+            )
+
+    monkeypatch.setattr(
+        optimizer_module.osqp,
+        "OSQP",
+        FakeOSQP,
+    )
+
+    problem = SimpleQuadraticProblem()
+    solver = GaussNewtonSolver()
+
+    with pytest.raises(RuntimeError, match=expected_error):
+        solver.gauss_newton_step(
+            problem,
+            np.array([[0.0]]),
+        )

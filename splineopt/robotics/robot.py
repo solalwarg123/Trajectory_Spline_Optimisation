@@ -6,9 +6,29 @@ import pinocchio as pin
 
 class Robot:
     """
-    Robot model based on Pinocchio.
+    Pinocchio-based robot model and kinematics interface.
 
-    Provides basic kinematic operations and optional Meshcat visualization.
+    Loads a robot from URDF and provides:
+        - Configuration manifold operations.
+        - Forward kinematics and frame Jacobians.
+        - Conversion between Pinocchio configurations and joint coordinates.
+        - Single-pose and sequential inverse kinematics.
+        - Optional Meshcat visualization.
+
+    Pinocchio distinguishes:
+        nq: Dimension of the configuration representation.
+        nv: Dimension of the tangent space.
+
+    These dimensions may differ, particularly for continuous joints.
+
+    Kinematic computations reuse Pinocchio data structures for efficiency.
+
+    Parameters
+    ----------
+    urdf_path:
+        Path to the robot URDF file.
+    end_effector_frame:
+        Optional default frame used for kinematics and IK.
     """
 
     def __init__(
@@ -23,9 +43,7 @@ class Robot:
                 f"URDF file not found:\n{self.urdf_path}"
             )
 
-        # ------------------------------------------------------------------
-        # Load Pinocchio model + geometry
-        # ------------------------------------------------------------------
+        # Load Pinocchio kinematic and geometry models
 
         mesh_dir = self.urdf_path.parent
 
@@ -48,9 +66,7 @@ class Robot:
             self.visual_model,
         )
 
-        # ------------------------------------------------------------------
-        # Basic information
-        # ------------------------------------------------------------------
+        # Expose configuration dimensions and joint limits
 
         self.nq = self.model.nq
         self.nv = self.model.nv
@@ -65,10 +81,12 @@ class Robot:
             frame.name
             for frame in self.model.frames
         ]
+        self._frame_ids = {
+            frame.name: i
+            for i, frame in enumerate(self.model.frames)
+        }
 
-        # ------------------------------------------------------------------
-        # Default end-effector
-        # ------------------------------------------------------------------
+        # Validate and store the default end-effector frame
 
         self.end_effector_frame = end_effector_frame
 
@@ -80,16 +98,12 @@ class Robot:
                     + "\n".join(self.frame_names)
                 )
 
-            self.end_effector_frame_id = self.model.getFrameId(
-                end_effector_frame
-            )
+            self.end_effector_frame_id = self._frame_ids[end_effector_frame]
 
         else:
             self.end_effector_frame_id = None
 
-        # ------------------------------------------------------------------
-        # Visualization
-        # ------------------------------------------------------------------
+        # Meshcat viewer is initialized lazily
 
         self.viewer = None
 
@@ -117,6 +131,12 @@ class Robot:
                 f"Expected v shape ({self.nv},), got {v.shape}."
             )
 
+        if not np.all(np.isfinite(v)):
+            raise ValueError("v must contain finite values.")
+
+        if not np.isfinite(dt):
+            raise ValueError("dt must be finite.")
+
         return pin.integrate(
             self.model,
             q,
@@ -129,26 +149,22 @@ class Robot:
 
     def frame_id(self, frame=None):
         """
-        Return the Pinocchio id of a frame.
+        Resolve a frame name to its Pinocchio frame ID.
 
-        If frame is None, use the default end-effector.
+        If frame is None, use the configured default end-effector.
         """
-
         if frame is None:
             if self.end_effector_frame_id is None:
                 raise ValueError(
                     "No frame specified and no default "
                     "end-effector configured."
                 )
-
             return self.end_effector_frame_id
 
-        if frame not in self.frame_names:
-            raise ValueError(
-                f"Unknown frame: {frame}"
-            )
-
-        return self.model.getFrameId(frame)
+        try:
+            return self._frame_ids[frame]
+        except (KeyError, TypeError):
+            raise ValueError(f"Unknown frame: {frame}") from None
 
     # ======================================================================
     # Forward kinematics
@@ -216,14 +232,32 @@ class Robot:
 
     def joint_positions_to_configuration(self, theta):
         """
-        Convert joint coordinates theta in R^nv to a Pinocchio
-        configuration q in the configuration manifold.
+        Convert tangent-space joint coordinates to a Pinocchio configuration.
 
-        For the fixed-base Kinova Gen3, nv = 7 and theta contains
-        the seven joint angles.
+        The coordinates theta have dimension nv and are integrated from
+        the robot's neutral configuration:
 
-        The conversion is performed by integrating theta from the
-        neutral configuration.
+            q = integrate(model, neutral(), theta)
+
+        For the fixed-base Kinova Gen3, theta represents the seven
+        joint angles. Continuous joints are represented internally
+        by Pinocchio using their manifold representation.
+
+        Parameters
+        ----------
+        theta:
+            Joint coordinate vector, shape (nv,).
+
+        Returns
+        -------
+        np.ndarray:
+            Pinocchio configuration, shape (nq,).
+
+        Notes
+        -----
+        This representation is intended for fixed-base manipulators.
+        For general configuration manifolds, theta is not necessarily
+        a globally unique Euclidean parameterization.
         """
 
         theta = np.asarray(
@@ -236,6 +270,8 @@ class Robot:
                 f"Expected theta shape ({self.nv},), "
                 f"got {theta.shape}."
             )
+        if not np.all(np.isfinite(theta)):
+            raise ValueError("theta must contain finite values.")
 
         return pin.integrate(
             self.model,
@@ -245,13 +281,19 @@ class Robot:
 
     def configuration_to_joint_positions(self, q):
         """
-        Convert one Pinocchio configuration to joint coordinates.
+        Convert a Pinocchio configuration to joint coordinates.
 
-        Note:
-        for continuous joints, this returns the shortest displacement
-        from the neutral configuration. For a trajectory, use
-        configuration_trajectory_to_joint_positions() instead so that
-        angles are unwrapped continuously.
+        Computes the shortest tangent-space displacement from the
+        neutral configuration:
+
+            theta = difference(model, neutral(), q)
+
+        For continuous joints, this may wrap angles to their principal
+        representation.
+
+        For a trajectory, use
+        configuration_trajectory_to_joint_positions() to accumulate
+        successive displacements and preserve angular continuity.
         """
 
         q = self._check_configuration(q)
@@ -267,11 +309,35 @@ class Robot:
         q_sequence,
     ):
         """
-        Convert a sequence of Pinocchio configurations to a continuous
-        joint trajectory theta(t) in R^nv.
+        Convert a Pinocchio configuration sequence to joint coordinates.
 
-        Successive Pinocchio differences are accumulated. This prevents
-        artificial +/- pi or +/- 2*pi jumps on continuous joints.
+        The initial coordinates are computed relative to neutral().
+        Subsequent coordinates are obtained by accumulating consecutive
+        Pinocchio configuration differences:
+
+            theta[0] = difference(neutral(), q[0])
+            theta[k] = theta[k-1] + difference(q[k-1], q[k])
+
+        For fixed-base manipulators, this unwraps continuous joint angles
+        along the trajectory, avoiding artificial jumps at angle boundaries.
+
+        Parameters
+        ----------
+        q_sequence:
+            Configuration array of shape (N, nq).
+
+        Returns
+        -------
+        np.ndarray:
+            Continuous joint coordinates of shape (N, nv).
+            An empty input produces an empty array with shape (0, nv).
+
+        Notes
+        -----
+        The accumulation assumes that consecutive configurations are
+        sufficiently close for the shortest manifold displacement to
+        represent the intended motion. It is not a general-purpose global
+        coordinate chart for arbitrary robot configuration manifolds.
         """
 
         q_sequence = np.asarray(
@@ -283,6 +349,9 @@ class Robot:
             raise ValueError(
                 "q_sequence must have shape (N, nq)."
             )
+
+        if not np.all(np.isfinite(q_sequence)):
+            raise ValueError("q_sequence must contain finite values.")
 
         if q_sequence.shape[1] != self.nq:
             raise ValueError(
@@ -329,7 +398,19 @@ class Robot:
         theta_sequence,
     ):
         """
-        Convert an (N, nv) joint trajectory to Pinocchio configurations.
+        Convert a sequence of joint coordinates to Pinocchio configurations.
+
+        Each row is integrated independently from the neutral configuration.
+
+        Parameters
+        ----------
+        theta_sequence:
+            Joint coordinates of shape (N, nv).
+
+        Returns
+        -------
+        np.ndarray:
+            Pinocchio configurations of shape (N, nq).
         """
 
         theta_sequence = np.asarray(
@@ -342,11 +423,17 @@ class Robot:
                 "theta_sequence must have shape (N, nv)."
             )
 
+        if not np.all(np.isfinite(theta_sequence)):
+            raise ValueError("theta_sequence must contain finite values.")
+
         if theta_sequence.shape[1] != self.nv:
             raise ValueError(
                 f"Expected theta_sequence shape (N, {self.nv}), "
                 f"got {theta_sequence.shape}."
             )
+
+        if len(theta_sequence) == 0:
+            return np.empty((0, self.nq), dtype=float)
 
         return np.asarray([
             self.joint_positions_to_configuration(theta)
@@ -487,35 +574,18 @@ class Robot:
             name=name,
         )
 
-    def animate(
-        self,
-        q_sequence,
-        dt=0.03,
-    ):
+    def animate(self, q_sequence, dt=0.03):
         """
-        Animate a sequence of robot configurations.
+        Animate a sequence of Pinocchio configurations in Meshcat.
+
+        The viewer is initialized automatically if necessary.
+        Validation of the trajectory and animation delay is delegated
+        to animate_configurations().
         """
+        from .visualization import animate_configurations
 
         if self.viewer is None:
             self.init_viewer()
-
-        q_sequence = np.asarray(
-            q_sequence,
-            dtype=float,
-        )
-
-        if q_sequence.ndim != 2:
-            raise ValueError(
-                "q_sequence must have shape (N, nq)."
-            )
-
-        if q_sequence.shape[1] != self.nq:
-            raise ValueError(
-                f"Expected configurations with dimension "
-                f"{self.nq}, got {q_sequence.shape[1]}."
-            )
-
-        from .visualization import animate_configurations
 
         animate_configurations(
             self.viewer,
@@ -529,15 +599,20 @@ class Robot:
 
     def _check_configuration(self, q):
         """
-        Convert q to a 1D numpy array and check its dimension.
-        """
+        Validate a Pinocchio configuration vector.
 
+        Checks its dimension and numerical finiteness without
+        enforcing joint limits or normalizing the configuration.
+        """
         q = np.asarray(q, dtype=float).reshape(-1)
 
         if q.shape != (self.nq,):
             raise ValueError(
                 f"Expected q shape ({self.nq},), got {q.shape}."
             )
+
+        if not np.all(np.isfinite(q)):
+            raise ValueError("Configuration must contain finite values.")
 
         return q
 
@@ -581,6 +656,17 @@ class Robot:
                 frame_name -> (position, jacobian)
 
             where position has shape (3,) and jacobian has shape (6, nv).
+
+        Notes
+        -----
+        A single kinematic update is shared across all requested frames,
+        avoiding redundant Pinocchio computations when multiple frame
+        positions and Jacobians are needed.
+
+        Repeated frame names are evaluated only once.
+
+        The returned arrays are copies and do not alias internal
+        Pinocchio data.
         """
 
         q = self._check_configuration(q)

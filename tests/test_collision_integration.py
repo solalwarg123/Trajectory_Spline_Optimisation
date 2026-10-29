@@ -916,3 +916,90 @@ def test_nonlinear_constraints_are_empty_without_collisions():
     assert upper.shape == (
         0,
     )
+
+
+def test_nonlinear_collision_values_and_jacobian():
+    """
+    Verify that the Cartesian problem correctly forwards
+    nonlinear collision distances and Jacobians.
+    """
+
+    class DummySpline:
+        n_control_points = 2
+        n_dof = 2
+
+    class DummyCollisionConstraints:
+        safety_distance = 0.02
+        n_constraints = 2
+        has_constraints = True
+
+        def distances(self, c):
+            c = np.asarray(c).reshape(-1)
+            return np.array([
+                [c[0] + 2.0 * c[1], c[2] - c[3]]
+            ])
+
+        def values_and_jacobian(self, c):
+            values = self.distances(c).reshape(-1)
+
+            J = sp.csc_matrix([
+                [1.0, 2.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, -1.0],
+            ])
+
+            return values, J
+
+    problem = MinimalCartesianProblem(
+        A=np.eye(4),
+        l=np.full(4, -10.0),
+        u=np.full(4, 10.0),
+        collision_constraints=DummyCollisionConstraints(),
+    )
+
+    problem.spline = DummySpline()
+
+    c = np.array([0.1, 0.2, 0.3, 0.4])
+
+    values = problem.nonlinear_constraints(c)
+    J = problem.nonlinear_constraints_jacobian(c)
+    lower, upper = problem.nonlinear_constraint_bounds()
+
+    np.testing.assert_allclose(
+        values,
+        [0.5, -0.1],
+    )
+
+    np.testing.assert_allclose(
+        J.toarray(),
+        [
+            [1.0, 2.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, -1.0],
+        ],
+    )
+
+    np.testing.assert_allclose(
+        lower,
+        [0.02, 0.02],
+    )
+
+    assert np.all(np.isposinf(upper))
+    assert J.shape == (2, 4)
+
+
+def test_collision_diagnostics_without_obstacles():
+    problem = MinimalCartesianProblem(
+        A=np.eye(2),
+        l=np.array([-1.0, -1.0]),
+        u=np.array([1.0, 1.0]),
+        collision_constraints=None,
+    )
+
+    c = np.array([0.2, -0.1])
+
+    distances = problem.collision_distances(c)
+    min_distance = problem.minimum_collision_distance(c)
+    feasible = problem.collision_feasible(c)
+
+    assert distances.shape == (0, 0)
+    assert np.isposinf(min_distance)
+    assert feasible

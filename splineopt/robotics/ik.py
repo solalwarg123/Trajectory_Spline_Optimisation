@@ -7,7 +7,15 @@ import pinocchio as pin
 @dataclass
 class IKResult:
     """
-    Result of an inverse kinematics solve.
+    Result of a single SE(3) inverse kinematics solve.
+
+    Attributes:
+        q: Final Pinocchio configuration, shape (nq,).
+        success: Whether the pose error reached the tolerance.
+        error_norm: Final norm of the 6D logarithmic pose error.
+        iterations: Number of configuration updates performed.
+        q_history: Configurations visited, including the initial one.
+        error_history: Pose error norm at each evaluated configuration.
     """
 
     q: np.ndarray
@@ -23,7 +31,16 @@ class IKResult:
 @dataclass
 class IKTrajectoryResult:
     """
-    Result of sequential inverse kinematics over a Cartesian trajectory.
+    Result of sequential inverse kinematics over Cartesian target poses.
+
+    Attributes:
+        q_pin: Sequence of Pinocchio configurations, shape (N, nq).
+        theta: Continuous joint coordinates, shape (N, nv).
+        success: True if all individual IK solves succeeded.
+        success_mask: Per-target success flags.
+        error_norms: Final pose errors for each target.
+        iterations: Iteration counts for each target.
+        results: Individual IKResult objects, including their histories.
     """
 
     q_pin: np.ndarray
@@ -85,7 +102,8 @@ def solve_pose_ik(
         Integration step.
 
     damping:
-        Damping coefficient used in the pseudo-inverse.
+        Positive damping coefficient used in the damped
+        least-squares normal equations.
 
     max_step_norm:
         Maximum norm of the tangent-space update before applying
@@ -97,9 +115,28 @@ def solve_pose_ik(
             "target_pose must be a pinocchio.SE3 object."
         )
 
-    # ------------------------------------------------------------------
-    # Initial configuration
-    # ------------------------------------------------------------------
+    if not np.isfinite(tolerance) or tolerance <= 0.0:
+        raise ValueError("tolerance must be finite and positive.")
+
+    if not isinstance(max_iterations, (int, np.integer)):
+        raise ValueError("max_iterations must be an integer.")
+
+    if max_iterations < 0:
+        raise ValueError("max_iterations must be non-negative.")
+
+    if not np.isfinite(step_size) or step_size <= 0.0:
+        raise ValueError("step_size must be finite and positive.")
+
+    if not np.isfinite(damping) or damping <= 0.0:
+        raise ValueError("damping must be finite and positive.")
+
+    if max_step_norm is not None:
+        if not np.isfinite(max_step_norm) or max_step_norm <= 0.0:
+            raise ValueError(
+                "max_step_norm must be None or finite and positive."
+            )
+
+    # Initialize the Pinocchio configuration
 
     if q0 is None:
         q = robot.neutral()
@@ -114,25 +151,21 @@ def solve_pose_ik(
                 f"Expected q0 shape ({robot.nq},), "
                 f"got {q.shape}."
             )
+        if not np.all(np.isfinite(q)):
+            raise ValueError("q0 must contain finite values.")
 
         q = q.copy()
 
-    # ------------------------------------------------------------------
-    # History
-    # ------------------------------------------------------------------
+    # Store configurations and errors for diagnostics
 
     q_history = [q.copy()]
     error_history = []
 
-    # ------------------------------------------------------------------
-    # Iterative IK
-    # ------------------------------------------------------------------
+    # Iterative damped SE(3) inverse kinematics
 
     for iteration in range(max_iterations + 1):
 
-        # --------------------------------------------------------------
-        # Current end-effector pose
-        # --------------------------------------------------------------
+        # Compute the current pose and target transform
 
         current_pose = robot.frame_pose(
             q,
@@ -144,14 +177,7 @@ def solve_pose_ik(
             target_pose
         )
 
-        # --------------------------------------------------------------
-        # SE(3) error
-        # --------------------------------------------------------------
-        #
-        # 6D error in the tangent space of SE(3).
-        #
-        # It contains both translation and rotation error.
-        # --------------------------------------------------------------
+        # Logarithmic pose error in the local frame
 
         error = pin.log6(
             current_to_target
@@ -165,9 +191,7 @@ def solve_pose_ik(
             error_norm
         )
 
-        # --------------------------------------------------------------
-        # Convergence
-        # --------------------------------------------------------------
+        # Stop when the pose error is sufficiently small
 
         if error_norm < tolerance:
 
@@ -180,20 +204,12 @@ def solve_pose_ik(
                 error_history=np.asarray(error_history),
             )
 
-        # --------------------------------------------------------------
-        # Maximum iterations reached
-        # --------------------------------------------------------------
+        # Evaluate the final error without taking another step
 
         if iteration == max_iterations:
             break
 
-        # --------------------------------------------------------------
-        # Frame Jacobian
-        # --------------------------------------------------------------
-        #
-        # The SE(3) error is expressed in the local frame, therefore
-        # we compute the frame Jacobian in LOCAL coordinates.
-        # --------------------------------------------------------------
+        # Express the frame Jacobian in LOCAL coordinates
 
         J = robot.frame_jacobian(
             q,
@@ -201,13 +217,7 @@ def solve_pose_ik(
             reference_frame=pin.ReferenceFrame.LOCAL,
         )
 
-        # --------------------------------------------------------------
-        # Jacobian of the SE(3) logarithmic error
-        # --------------------------------------------------------------
-        #
-        # This is the same correction used in Pinocchio's official
-        # iterative IK example.
-        # --------------------------------------------------------------
+        # Correct the Jacobian for the SE(3) logarithmic error
 
         J_error = (
             -pin.Jlog6(
@@ -216,12 +226,7 @@ def solve_pose_ik(
             @ J
         )
 
-        # --------------------------------------------------------------
-        # Damped least squares
-        # --------------------------------------------------------------
-        #
-        # dq = -J^T (J J^T + lambda I)^-1 e
-        # --------------------------------------------------------------
+        # Compute the damped least-squares update
 
         JJt = (
             J_error
@@ -237,9 +242,7 @@ def solve_pose_ik(
             )
         )
 
-        # --------------------------------------------------------------
-        # Limit very large updates
-        # --------------------------------------------------------------
+        # Clip excessively large tangent-space updates
 
         if max_step_norm is not None:
 
@@ -253,9 +256,7 @@ def solve_pose_ik(
                     / dq_norm
                 )
 
-        # --------------------------------------------------------------
         # Update configuration
-        # --------------------------------------------------------------
 
         q = robot.integrate(
             q,
@@ -267,9 +268,7 @@ def solve_pose_ik(
             q.copy()
         )
 
-    # ------------------------------------------------------------------
-    # No convergence
-    # ------------------------------------------------------------------
+    # Return the final configuration and diagnostics
 
     return IKResult(
         q=q.copy(),
@@ -290,11 +289,43 @@ def solve_pose_ik_trajectory(
     **ik_kwargs,
 ):
     """
-    Solve a sequence of SE(3) inverse kinematics problems.
+    Solve inverse kinematics sequentially over Cartesian target poses.
 
-    Each solution is used as the initial configuration of the next IK.
-    This encourages continuity of the joint trajectory and is especially
-    important for redundant robots such as the 7-DoF Kinova Gen3.
+    Each IK solution initializes the next solve, encouraging continuity
+    of the joint trajectory, especially for redundant manipulators.
+
+    The resulting Pinocchio configurations are converted to continuous
+    joint coordinates using the Robot interface.
+
+    Parameters
+    ----------
+    robot:
+        Robot instance providing kinematics and configuration conversions.
+    target_poses:
+        Non-empty sequence of desired pin.SE3 poses.
+    q0:
+        Optional initial Pinocchio configuration, shape (nq,).
+        Defaults to the neutral configuration.
+    frame:
+        Controlled frame. Defaults to the robot end-effector frame.
+    stop_on_failure:
+        If True, raise RuntimeError on the first unsuccessful IK solve.
+        If False, continue using the last returned configuration.
+    **ik_kwargs:
+        Additional parameters forwarded to solve_pose_ik().
+
+    Returns
+    -------
+    IKTrajectoryResult:
+        Pinocchio configurations, continuous joint coordinates,
+        success flags, pose errors, iteration counts and individual results.
+
+    Raises
+    ------
+    ValueError:
+        If the target sequence is empty or q0 is invalid.
+    RuntimeError:
+        If an IK solve fails and stop_on_failure is True.
     """
 
     target_poses = list(
@@ -306,9 +337,7 @@ def solve_pose_ik_trajectory(
             "target_poses cannot be empty."
         )
 
-    # ------------------------------------------------------------------
-    # Initial configuration
-    # ------------------------------------------------------------------
+    # Initialize the configuration for sequential IK
 
     if q0 is None:
         q_current = robot.neutral()
@@ -323,12 +352,12 @@ def solve_pose_ik_trajectory(
                 f"Expected q0 shape ({robot.nq},), "
                 f"got {q_current.shape}."
             )
+        if not np.all(np.isfinite(q_current)):
+            raise ValueError("q0 must contain finite values.")
 
         q_current = q_current.copy()
 
-    # ------------------------------------------------------------------
-    # Storage
-    # ------------------------------------------------------------------
+    # Store individual solutions and convergence diagnostics
 
     results = []
     q_sequence = []
@@ -337,9 +366,7 @@ def solve_pose_ik_trajectory(
     error_norms = []
     iterations = []
 
-    # ------------------------------------------------------------------
-    # Sequential IK
-    # ------------------------------------------------------------------
+    # Warm-start each IK from the previous solution
 
     for k, target_pose in enumerate(
         target_poses
@@ -382,9 +409,7 @@ def solve_pose_ik_trajectory(
             q_current
         )
 
-    # ------------------------------------------------------------------
-    # Convert Pinocchio configurations to continuous joint coordinates
-    # ------------------------------------------------------------------
+    # Convert configurations to continuous joint coordinates
 
     q_sequence = np.asarray(
         q_sequence

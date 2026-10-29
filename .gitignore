@@ -1,11 +1,59 @@
-__pycache__/
-*.pyc
-.pytest_cache/
 
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Tests and coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# IDEs and editor files
 .vscode/
 .idea/
+*.swp
+*.swo
 
+# Generated experiment results
+outputs/
+
+# Profiling and benchmark logs
+*.prof
 *.log
-*.tmp
+benchmark_*.txt
 
+# Internal development notes
+résumés/
+PLAN.md
+
+# Temporary files
+*.tmp
+*.bak
+*~
+
+# Local documentation
 Projet_B_SPline.pdf
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+desktop.ini

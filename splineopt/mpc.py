@@ -1,5 +1,23 @@
 
-"""Receding-horizon Cartesian MPC with feasible warm starts."""
+
+"""
+Receding-horizon Cartesian MPC for B-spline robot trajectories.
+
+This module provides the MPC orchestration layer built on top
+of a Cartesian trajectory optimization problem and a solver.
+
+At each control cycle, the MPC:
+    - Updates the initial robot state and Cartesian references.
+    - Reuses and projects the previous B-spline trajectory.
+    - Optionally activates nearby static collision obstacles.
+    - Solves the updated trajectory optimization problem.
+    - Accepts feasible solutions even without solver convergence.
+    - Falls back to a feasible projected warm start when needed.
+
+The module does not implement robot dynamics or a low-level
+controller. Collision feasibility is checked at sampled points
+and does not guarantee continuous collision avoidance.
+"""
 
 from time import perf_counter
 
@@ -9,18 +27,25 @@ import scipy.sparse as sp
 
 
 class CartesianMPC:
+
     """
-    Receding-horizon Cartesian trajectory optimizer.
+    Receding-horizon Cartesian trajectory optimization controller.
 
-    Features:
-        - Current-state update
-        - Optional feasible warm-start projection
-        - Cached OSQP projection workspace
-        - Optional per-obstacle collision activation
-        - Final collision feasibility check
+    The MPC maintains a B-spline trajectory as a warm start and
+    reoptimizes it when the robot state or target poses change.
 
-    Collision filtering is a sampled broad-phase.
-    It does not guarantee continuous collision avoidance.
+    The supplied problem owns the objective and constraints, while
+    the solver performs the numerical optimization.
+
+    A feasible trajectory may be accepted even when the solver
+    reports non-convergence. Feasibility is checked independently
+    against joint constraints and, when enabled, static obstacles.
+
+    Optional collision filtering activates nearby obstacles to
+    reduce optimization cost. Final collision checks always use
+    the complete obstacle set.
+
+    The selected trajectory is stored for reuse at the next cycle.
     """
 
     def __init__(
@@ -108,13 +133,6 @@ class CartesianMPC:
         self.last_collision_info = None
         self.last_projection_info = None
 
-        # Initial-state equality matrices.
-        #
-        # Initialized lazily: lightweight test problems
-        # do not necessarily expose a complete B-spline.
-        self._initial_E = None
-        self._initial_G_inv = None
-
         # Cached OSQP projection workspace.
         self._projection_solver = None
         self._projection_A = None
@@ -155,56 +173,6 @@ class CartesianMPC:
         )
 
         self.last_projection_info = None
-
-    def _initialize_initial_state_matrices(self):
-        """
-        Lazily initialize the mapping:
-
-            E @ c = [q(0), qdot(0)]
-
-        The matrix depends only on the spline.
-        """
-
-        if self._initial_E is not None:
-            return
-
-        spline = self.problem.spline
-        t0 = spline.t_start
-
-        E = np.vstack([
-            spline.evaluation_matrix(
-                t0,
-                derivative_order=0,
-            ),
-            spline.evaluation_matrix(
-                t0,
-                derivative_order=1,
-            ),
-        ])
-
-        E = np.asarray(E, dtype=float)
-
-        expected_shape = (
-            2 * spline.n_dof,
-            spline.n_control_points * spline.n_dof,
-        )
-
-        if E.shape != expected_shape:
-            raise ValueError(
-                "Invalid initial-state evaluation matrix: "
-                f"expected {expected_shape}, got {E.shape}."
-            )
-
-        G = E @ E.T
-
-        if np.linalg.matrix_rank(G) != G.shape[0]:
-            raise ValueError(
-                "Initial position/velocity constraints "
-                "are not independent."
-            )
-
-        self._initial_E = E
-        self._initial_G_inv = np.linalg.inv(G)
 
     def _rebase_initial_state(self, c, q0, v0):
         """Rebase the first two control points to match q0 and v0."""
@@ -402,9 +370,41 @@ class CartesianMPC:
 
     def _prepare_warm_start(self, q0, v0):
         """
-        Prepare warm start for the current MPC cycle.
+        Prepare a feasible warm start for the current MPC cycle.
 
-        Must be called AFTER problem.update().
+        The previous B-spline trajectory is reused to initialize the
+        new optimization problem. However, it may no longer satisfy
+        the updated initial state or joint constraints.
+
+        When projection is enabled, the warm start is prepared in
+        two steps:
+
+        1. Rebase the first two control points to match the current
+        joint position q0 and velocity v0.
+
+        2. Project the rebased trajectory onto the linear feasible
+        set by solving:
+
+            minimize 0.5 * ||c - c_rebased||²
+            subject to lower <= A @ c <= upper
+
+        This restores joint position, velocity, acceleration and
+        boundary constraints while minimizing the modification
+        of the control points.
+
+        The projected trajectory can be used as the initial guess
+        for Gauss-Newton and as a feasible fallback if optimization
+        fails to produce an acceptable solution.
+
+        Must be called after problem.update(), so that the linear
+        constraints correspond to the current MPC cycle.
+
+        Note:
+            Projection enforces only linear constraints. Collision
+            feasibility must be checked separately.
+
+        Returns:
+            Initial control points for the current optimization.
         """
 
         c_old = self.previous_control_points.copy()
@@ -485,6 +485,17 @@ class CartesianMPC:
         return self._collision_cache[indices]
 
     def _near_obstacles(self, control_points):
+        """
+        Return indices of obstacles close to the candidate trajectory.
+
+        The collision builder samples the trajectory at the configured
+        number of points and uses collision_activation_distance to
+        select potentially relevant obstacles.
+
+        Returns:
+            Obstacle indices to activate for the next optimization.
+        """
+
         return self._full_collision.near_obstacle_indices(
             control_points,
             activation_distance=(
@@ -526,6 +537,16 @@ class CartesianMPC:
             )
 
     def _control_points(self, result):
+        """
+        Extract and validate control points from a solver result.
+
+        The returned array has shape (n_control_points, n_dof).
+        Invalid dimensions or non-finite values are rejected.
+
+        Raises:
+            RuntimeError: If the solver result contains invalid
+                control points.
+        """
         c = np.asarray(
             result.control_points,
             dtype=float,
@@ -577,11 +598,7 @@ class CartesianMPC:
                 c, A, lower, upper
             )
 
-            tolerance = getattr(
-                self,
-                "linear_feasibility_tolerance",
-                self.projection_tolerance,
-            )
+            tolerance = self.linear_feasibility_tolerance
 
             linear_feasible = bool(violation <= tolerance)
 
@@ -601,13 +618,9 @@ class CartesianMPC:
         #
         # Lightweight test doubles without linear constraints
         # retain the previous solver-status-based behavior.
-        accepted = (
-            (
-                linear_feasible
-                if has_linear_constraints
-                else solver_success
-            )
-            and collision_ok
+
+        accepted = collision_ok and (
+            linear_feasible if has_linear_constraints else solver_success
         )
 
         self.last_solution_info = {
@@ -659,6 +672,15 @@ class CartesianMPC:
 
         The returned result always contains the selected
         control points if a feasible candidate is available.
+
+        Note:
+        When a projected warm start is selected, the returned
+        result contains its control points but retains the original
+        Gauss-Newton solver diagnostics.
+
+        last_solution_info["solution_source"] identifies whether
+        the selected trajectory comes from Gauss-Newton or from
+        the projected warm start.
         """
         from copy import copy
 
@@ -813,6 +835,20 @@ class CartesianMPC:
             1. Feasible GN solution.
             2. Feasible projected warm start.
             3. Rejection if neither is feasible.
+
+
+        Args:
+            q0: Current joint positions, shape (n_dof,).
+            v0: Current joint velocities, shape (n_dof,).
+            target_poses: Cartesian targets for the current horizon,
+                in the format expected by the problem.
+            verbose: Enable verbose solver output.
+
+        Returns:
+            Solver result containing the selected control points.
+            Inspect last_solution_info["accepted"] before execution,
+            since a result may also be returned when no feasible
+            candidate was found.
         """
 
         # ==================================================
@@ -903,7 +939,28 @@ class CartesianMPC:
 
         solves = 1
 
-        c = self._control_points(result)
+        def finalize_invalid_result(result):
+            """Try a feasible fallback when GN returns invalid control points."""
+            self.last_collision_info = {
+                "filtered": True,
+                "active_indices": tuple(sorted(active)),
+                "active_count": len(active),
+                "total_obstacles": full.environment.n_obstacles,
+                "solve_count": solves,
+                "feasible": False,
+            }
+
+            return self._finalize_solution(
+                result,
+                c_init,
+                has_collisions=True,
+                collision_feasible=False,
+            )
+
+        try:
+            c = self._control_points(result)
+        except (RuntimeError, ValueError):
+            return finalize_invalid_result(result)
 
         # ==================================================
         # 5. Detect newly approached obstacles
@@ -925,7 +982,10 @@ class CartesianMPC:
 
             solves += 1
 
-            c = self._control_points(result)
+            try:
+                c = self._control_points(result)
+            except (RuntimeError, ValueError):
+                return finalize_invalid_result(result)
 
         # ==================================================
         # 6. Verify all collision constraints
@@ -953,7 +1013,10 @@ class CartesianMPC:
 
                 solves += 1
 
-                c = self._control_points(result)
+                try:
+                    c = self._control_points(result)
+                except (RuntimeError, ValueError):
+                    return finalize_invalid_result(result)
 
                 feasible = (
                     self._full_collision_feasible(c)
