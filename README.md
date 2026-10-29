@@ -557,6 +557,24 @@ This project demonstrates how B-splines can provide a unified framework for robo
 Beyond individual optimization problems, the framework illustrates the potential of B-spline MPC as an intermediate layer between high-level motion generation and low-level robot control. While the current results are limited to simulation, the modular implementation provides a foundation for further exploration of real-time optimization, collision-aware control, and integration with learned robotic policies.
 
 
+## Benchmark environment
+
+The experiments were conducted in simulation. Computation times depend on the hardware, numerical libraries, solver configurations, and optimization parameters.
+
+**Hardware and software configuration:**
+
+- **CPU:** AMD Ryzen 7 4800H
+- **Operating system:** Windows 11 Home
+- **Python:** 3.11.16
+- **NumPy:** 2.4.6
+- **SciPy:** 1.17.1
+- **OSQP:** 1.1.3
+- **Pinocchio:** 4.1.0
+- **CyIpopt:** 1.7.0
+
+The experiment scripts and their main parameters are documented in the corresponding sections. Reported computation times are specific to the tested configurations and should not be interpreted as hard real-time performance guarantees.
+
+
 ## License
 
 This project uses separate licenses for its original source code and third-party robotic assets.
@@ -565,3 +583,4 @@ This project uses separate licenses for its original source code and third-party
 - **Kinova robot assets:** The URDF and mesh files in `assets/robots/kinova3_flat/` are derived from the official [Kinova ROS Kortex repository](https://github.com/Kinovarobotics/ros_kortex). These resources remain subject to Kinova's BSD 3-Clause License and associated notices. See [assets/robots/LICENSE](assets/robots/LICENSE).
 
 The MIT License does not replace or override the license applicable to the Kinova assets.
+
