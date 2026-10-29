@@ -526,51 +526,36 @@ conda create -n bspline python=3.11 -y
 conda activate bspline
 ```
 
-### 3. Install robotics dependencies
+### 3. Install Pinocchio
 
-Install Pinocchio and Meshcat from conda-forge:
+Install Pinocchio through conda-forge:
 
 ```bash
-conda install -c conda-forge pinocchio meshcat -y
+conda install -c conda-forge pinocchio -y
 ```
 
-For examples using IPOPT, also install:
+### 4. Install the project and dependencies
+
+Install the project in editable mode, including robotics, visualization, and testing dependencies:
+
+```bash
+python -m pip install -e ".[robotics,dev]"
+```
+
+This installs the core optimization library together with its required dependencies, including NumPy, SciPy, OSQP, Meshcat, Matplotlib, and pytest.
+
+### 5. IPOPT support
+
+To run examples using IPOPT, install CyIpopt through conda-forge:
 
 ```bash
 conda install -c conda-forge cyipopt -y
 ```
 
-IPOPT is optional. The core library and Gauss-Newton examples do not require it.
-
-### 4. Install the project
-
-From the repository root, install the package in editable mode with its development and visualization dependencies:
-
-```bash
-python -m pip install -e .
-```
-
-Editable installation allows changes to the local `splineopt/` source code to be used immediately without reinstalling the package.
-
-### 5. Verify the installation
-
-Run the automated tests:
+### 6. Verify the installation
 
 ```bash
 python -m pytest -q
-```
-
-Then try a basic example:
-
-```bash
 python -m examples.basics.trajectory_projection
 ```
-
-For a Kinova demonstration:
-
-```bash
-python -m examples.offline.kinova_optimization --no-animation
-```
-
-Kinova simulations use the robot model provided under `assets/robots/kinova3_flat/`. Examples should be executed from the repository root.
 
