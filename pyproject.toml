@@ -1,0 +1,42 @@
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "splineopt"
+version = "0.1.0"
+description = "B-spline trajectory optimization for robotic motion"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "osqp",
+]
+
+[project.optional-dependencies]
+robotics = [
+    "pin",
+    "meshcat",
+    "matplotlib",
+]
+
+ipopt = [
+    "cyipopt",
+]
+
+dev = [
+    "pytest",
+]
+
+all = [
+    "pin",
+    "meshcat",
+    "matplotlib",
+    "cyipopt",
+    "pytest",
+]
+
+[tool.setuptools.packages.find]
+include = ["splineopt*"]

@@ -506,3 +506,71 @@ The reported acceleration and jerk metrics are obtained from finite differences 
 Finally, the results should not be interpreted as proof that smoothing always improves task performance. A learned policy operating in closed loop and generating more consistent action chunks might require substantially less correction.
 
 The experiment instead illustrates a practical application of the framework: **converting noisy, chunked motion references into smoother, constraint-aware robot trajectories within a limited computation budget**.
+
+## Installation
+
+The project requires **Python 3.10 or later**. A Conda environment is recommended to manage the robotics and numerical optimization dependencies.
+
+### 1. Clone the repository
+
+```bash
+git clone https://github.com/solalwarg123/Trajectory_Spline_Optimisation.git
+```
+
+### 2. Create a Conda environment
+
+Create and activate a dedicated environment:
+
+```bash
+conda create -n bspline python=3.11 -y
+conda activate bspline
+```
+
+### 3. Install robotics dependencies
+
+Install Pinocchio and Meshcat from conda-forge:
+
+```bash
+conda install -c conda-forge pinocchio meshcat -y
+```
+
+For examples using IPOPT, also install:
+
+```bash
+conda install -c conda-forge cyipopt -y
+```
+
+IPOPT is optional. The core library and Gauss-Newton examples do not require it.
+
+### 4. Install the project
+
+From the repository root, install the package in editable mode with its development and visualization dependencies:
+
+```bash
+python -m pip install -e .
+```
+
+Editable installation allows changes to the local `splineopt/` source code to be used immediately without reinstalling the package.
+
+### 5. Verify the installation
+
+Run the automated tests:
+
+```bash
+python -m pytest -q
+```
+
+Then try a basic example:
+
+```bash
+python -m examples.basics.trajectory_projection
+```
+
+For a Kinova demonstration:
+
+```bash
+python -m examples.offline.kinova_optimization --no-animation
+```
+
+Kinova simulations use the robot model provided under `assets/robots/kinova3_flat/`. Examples should be executed from the repository root.
+
