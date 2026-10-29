@@ -6,7 +6,7 @@ A Python framework for robot trajectory generation and optimization using B-spli
 
 B-splines provide a flexible and compact representation of continuous trajectories, making them particularly useful for robotic motion optimization. Their mathematical properties allow trajectory smoothness, tracking objectives, and joint constraints to be incorporated into a common optimization framework.
 
-This project explores several adjacents applications of B-spline trajectory optimization:
+This project explores several applications of B-spline trajectory optimization:
 
 - **Trajectory generation and projection:** generate smooth trajectories or project existing references onto trajectories satisfying joint position, velocity, and acceleration constraints.
 - **Cartesian trajectory optimization:** optimize robot motion to track desired end-effector positions and orientations using forward kinematics.
@@ -205,8 +205,6 @@ python -m examples.offline.kinova_optimization --no-animation
 
 *End-effector position and orientation errors for the different optimization methods.*
 
-The experiments highlight the importance of choosing an optimization objective suited to the task. Joint-space projection guarantees feasibility but does not necessarily preserve the end-effector pose, while Cartesian optimization exploits the robot's kinematic redundancy to improve tracking.
-
 | Method | Position RMS | Orientation RMS | Solve time |
 |---|---:|---:|---:|
 | Joint-space QP | 75.89 mm | 10.68° | 0.096 s |
@@ -214,22 +212,11 @@ The experiments highlight the importance of choosing an optimization objective s
 | GN full-pose | 13.06 mm | 5.85° | 0.791 s |
 | IPOPT full-pose | 12.76 mm | 5.67° | 12.365 s |
 
-The **joint-space QP** is the fastest method, but produces the largest position error. Position-only Gauss-Newton substantially improves translational tracking, at the expense of large orientation deviations.
+Joint-space QP is the fastest approach, but minimizing deviations in joint coordinates does not necessarily preserve the end-effector pose: its position error reaches approximately 200 mm at the most difficult point of the trajectory.
 
-Full-pose Gauss-Newton provides a more balanced result, achieving **13.06 mm position RMS and 5.85° orientation RMS in 0.79 s**.
+Position-only Gauss-Newton substantially improves translational tracking, but orientation deviations can exceed 70° because orientation is not included in its objective. Full-pose Gauss-Newton balances both objectives, achieving **13.06 mm position RMS** and **5.85° orientation RMS** in **0.79 s**.
 
-IPOPT achieves slightly better tracking accuracy, but requires **12.37 s**, approximately 15.6 times longer than full-pose Gauss-Newton in this experiment.
-
-These results illustrate the trade-off between **tracking accuracy, optimization objectives, and computational cost**.
-The results highlight the importance of optimizing in the appropriate space.
-
-The **joint-space QP** satisfies joint constraints but introduces substantial Cartesian tracking error, reaching approximately 200 mm at the most difficult point of the trajectory. This occurs because minimizing changes in joint coordinates does not necessarily preserve the end-effector pose.
-
-By contrast, **Cartesian Gauss-Newton and IPOPT** significantly improve end-effector tracking by explicitly accounting for robot forward kinematics.
-
-However, position-only Gauss-Newton illustrates another trade-off: although it achieves good translational accuracy, its orientation can deviate by more than 70° from the reference. Full-pose optimization avoids this behavior by including orientation tracking in the objective.
-
-For the evaluated scenario, full-pose Gauss-Newton achieves approximately **13.1 mm RMS position error** and **5.85° RMS orientation error**, compared with **75.9 mm RMS position error** for the joint-space QP.
+IPOPT achieves slightly lower errors in this scenario, but its **12.37 s** solve time is approximately 15.6 times that of full-pose Gauss-Newton. These results illustrate the trade-off between tracking objectives, accuracy, and computational cost.
 
 #### Joint constraint satisfaction
 
@@ -245,9 +232,7 @@ The figure also illustrates how the different methods exploit the available join
 
 #### Collision avoidance
 
-The framework also supports geometric collision constraints during offline Cartesian optimization.
-
-In this demonstration, the nominal trajectory intersects a spherical obstacle. The optimizer modifies the robot motion to avoid the obstacle while respecting joint limits and maintaining Cartesian tracking as closely as possible.
+The framework also supports geometric collision constraints during offline Cartesian optimization. In this demonstration, the nominal trajectory intersects a spherical obstacle. The optimizer modifies the robot motion to avoid the obstacle while respecting joint limits and tracking the Cartesian reference as closely as possible.
 
 **Run the example:**
 
@@ -259,35 +244,17 @@ python -m examples.offline.kinova_collision_optimization --scenario avoidance --
 
 *Collision-aware trajectory optimization on the Kinova Gen3, illustrated with a spherical obstacle.*
 
-The optimization introduces a geometric constraint requiring a minimum signed clearance between the robot and the obstacle.
-
 For a prescribed safety margin of **20 mm**, the experiment produces:
 
-| Trajectory | Minimum clearance |
-|---|---:|
-| Nominal trajectory | −124.9 mm |
-| Collision-aware Gauss-Newton | +19.8 mm |
+| Method | Position RMS | Minimum clearance | Solve time |
+|---|---:|---:|---:|
+| FREE (no collision constraints) | 0.14 mm | −124.90 mm | 0.747 s |
+| Collision-aware GN | 29.32 mm | +19.79 mm | 3.069 s |
 
-The negative nominal clearance indicates substantial geometric intersection, while the optimized trajectory avoids contact and approaches the prescribed safety margin within numerical tolerance.
+Without collision constraints, the trajectory closely tracks the reference but intersects the obstacle. Collision-aware Gauss-Newton avoids geometric contact and reaches the requested margin within numerical tolerance, at the expense of higher position error and approximately four times the solve time.
 
-This requires a deviation from the nominal trajectory, illustrating the trade-off between Cartesian tracking accuracy and collision avoidance.
+**Limitation:** unlike the joint constraints, collision clearances are checked at selected trajectory points. Satisfaction at those points does not guarantee collision avoidance at every intermediate instant.
 
-Unlike the joint constraints, collision constraints are checked at selected points along the trajectory and do not provide a general continuous-time collision-free guarantee.
-
-For a prescribed safety margin of **20 mm**, the experiment produces:
-
-| Method | Position RMS | Minimum clearance | Solve time | Safety |
-|---|---:|---:|---:|---|
-| FREE (no collision constraints) | 0.14 mm | −124.90 mm | 0.747 s | FAIL |
-| Collision-aware GN | 29.32 mm | +19.79 mm | 3.069 s | PASS |
-
-Without collision constraints, the optimizer achieves nearly perfect Cartesian tracking in approximately 0.75 s, but the resulting trajectory intersects the obstacle significantly.
-
-With collision-aware Gauss-Newton, the optimization takes approximately 3.07 s and produces a trajectory that avoids geometric contact, reaching the prescribed 20 mm safety margin within numerical tolerance.
-
-This illustrates a three-way trade-off between **tracking accuracy, collision avoidance, and computational cost**. Enforcing collision constraints increases the position RMS error from 0.14 mm to 29.32 mm and the solve time by approximately a factor of four.
-
-Unlike joint constraints, collision constraints are evaluated at selected points along the trajectory and do not provide a general continuous-time collision-free guarantee.
 ### 3. Model Predictive Control on Kinova Gen3
 
 The B-spline optimization framework is extended to a receding-horizon setting, where a new trajectory is computed at each control cycle from the current robot state.
@@ -401,7 +368,6 @@ Both MPC approaches are tested with Gauss-Newton iteration budgets of two and fi
 python -m examples.mpc.kinova_mpc_cluttered_tracking --no-animation --show-plots
 ```
 
-<!-- Replace the filename with the exported 3D trajectory figure. -->
 ![Kinova Gen3 trajectory in a cluttered environment](figures/kinova_mpc_cluttered_3d.png)
 
 *Three-dimensional visualization of the Kinova Gen3 trajectory and surrounding obstacles in the cluttered MPC benchmark.*
@@ -559,3 +525,43 @@ python -m pytest -q
 python -m examples.basics.trajectory_projection
 ```
 
+## Project structure
+
+```text
+splineopt/          Core B-spline trajectory optimization library
+examples/
+  basics/           B-spline fundamentals and joint-space projection
+  offline/          Kinova Cartesian and collision-aware optimization
+  mpc/              Receding-horizon tracking and benchmarks
+  policy/           Simulated policy-generated motion
+  utils/            Shared example helpers
+tests/              Automated test suite
+assets/robots/      Kinova model and third-party license
+figures/            Illustrations used in this README
+pyproject.toml      Package configuration and optional dependencies
+```
+
+The example scripts should be run from the repository root so they can locate the included Kinova model and shared helpers. Generated experiment results are written to `outputs/`, which is excluded from version control.
+
+## Scope and limitations
+
+This project is a **simulation-based trajectory optimization framework**, not a validated hardware controller. Continuous-time joint position, velocity, and acceleration bounds are enforced through B-spline control-point constraints, while collision clearances are evaluated only at selected points. Thus, the collision-aware methods do not provide a general continuous-time collision-free guarantee.
+
+MPC computation times are measured in the tested simulation environment; they do not establish hard real-time guarantees on a physical robot. The policy example uses a simulated high-level policy and simulated inference latency rather than a trained model or a deployed inference pipeline.
+
+The experiments are intended to compare optimization formulations, their numerical behavior, and practical trade-offs in tracking accuracy, feasibility, and computational cost.
+## Conclusion
+
+This project demonstrates how B-splines can provide a unified framework for robotic trajectory generation and optimization, from offline trajectory projection to constrained Cartesian optimization and receding-horizon control. The experiments highlight the trade-offs between tracking accuracy, motion smoothness, constraint satisfaction, and computational efficiency, particularly when collision avoidance is introduced.
+
+Beyond individual optimization problems, the framework illustrates the potential of B-spline MPC as an intermediate layer between high-level motion generation and low-level robot control. While the current results are limited to simulation, the modular implementation provides a foundation for further exploration of real-time optimization, collision-aware control, and integration with learned robotic policies.
+
+
+## License
+
+This project uses separate licenses for its original source code and third-party robotic assets.
+
+- **Original code:** The `splineopt/`, `examples/`, and `tests/` directories are licensed under the MIT License. See [LICENSE](LICENSE). Copyright © 2026 Solal Wargon.
+- **Kinova robot assets:** The URDF and mesh files in `assets/robots/kinova3_flat/` are derived from the official [Kinova ROS Kortex repository](https://github.com/Kinovarobotics/ros_kortex). These resources remain subject to Kinova's BSD 3-Clause License and associated notices. See [assets/robots/LICENSE](assets/robots/LICENSE).
+
+The MIT License does not replace or override the license applicable to the Kinova assets.
