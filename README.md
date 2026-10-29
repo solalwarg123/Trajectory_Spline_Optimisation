@@ -1,6 +1,20 @@
 # B-Spline Trajectory Optimization for Robot Motion
 
-A Python framework for robot trajectory generation and optimization using B-splines, with applications ranging from offline motion planning to constrained Cartesian optimization, collision avoidance, and Model Predictive Control (MPC).
+
+This project implements and evaluates B-spline-based trajectory optimization methods for robotic manipulators, with a focus on constrained motion planning and Model Predictive Control (MPC). It covers the full pipeline from trajectory representation and numerical optimization to robot kinematics, collision avoidance, and closed-loop control.
+
+![Collision-aware trajectory optimization on a simulated Kinova Gen3](figures/collision_avoidance.gif)
+
+*Collision-aware trajectory optimization on a simulated Kinova Gen3 7-DoF manipulator.*
+
+**Selected results:**
+
+- **Cartesian MPC:** Gauss-Newton averaged 40.44 ms per control cycle, compared with 169.16 ms for IPOPT, in a tracking experiment with a 100 ms control period.
+- **Collision avoidance:** an offline optimization experiment improved minimum sampled obstacle clearance from −124.90 mm to +19.79 mm, at the expense of tracking accuracy and computation time.
+- **Policy-generated motion:** B-spline MPC reduced joint jerk RMS by approximately 98% compared with direct execution of simulated noisy action chunks, at the cost of increased tracking error.
+
+The methods have been evaluated through numerical experiments and robotic simulations. Validation on physical hardware has not yet been performed.
+
 
 ## Overview
 
